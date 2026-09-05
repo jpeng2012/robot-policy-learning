@@ -4,6 +4,7 @@ import os
 import pickle
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from experts.pick_place_expert import pick_place_expert_action
+from experts.constrained_pick_place_expert import constrained_pick_place_expert_action
 from envs.constrained_pick_place import ConstrainedPickPlace
 
 
@@ -13,13 +14,13 @@ def sample_target(cube_pos):
     """
 
     target_x = np.random.uniform(
-        -0.10,
-        0.10,
+        -0.08,
+        0.08,
     )
 
     target_y = np.random.uniform(
-        0.15,
-        0.20,
+        0.27,
+        0.32,
     )
 
     return np.array([
@@ -30,8 +31,8 @@ def sample_target(cube_pos):
 
 placement_initializer = UniformRandomSampler(
     name="ObjectSampler",
-    x_range=[-0.10, 0.10],
-    y_range=[-0.18, -0.10],
+    x_range=[-0.08, 0.08],
+    y_range=[-0.05, 0.02],
     rotation=None,
     ensure_object_boundary_in_range=True,
     ensure_valid_placement=True,
@@ -69,16 +70,16 @@ env.set_target(target_cube_pos)
 # Get observations again because target changed
 obs = env._get_observations()
 
-print("cube:", obs["cube_pos"])
-print("target:", obs["target_pos"])
-print("barrier:", obs["barrier_pos"])
-print(
-    "barrier half size:",
-    obs["barrier_half_size"],
-)
+# print("cube:", obs["cube_pos"])
+# print("target:", obs["target_pos"])
+# print("barrier:", obs["barrier_pos"])
+# print(
+#     "barrier half size:",
+#     obs["barrier_half_size"],
+# )
 
 
-target_successes = 2
+target_successes = 10
 num_success = 0
 attempts = 0
 trajectory_lengths = []
@@ -114,6 +115,9 @@ while attempts <2*target_successes and num_success < target_successes:
     ctx = {
         "grasped": False, 
         "grasp_offset": None,
+        "route": np.random.choice(["LEFT", "RIGHT"]),
+        "transport_stage": 0,
+        "grasp_count": 0,
         }
 
 
@@ -128,7 +132,7 @@ while attempts <2*target_successes and num_success < target_successes:
         ctx["grasped"] = grasped
         state_before_action = state
         
-        action, state = pick_place_expert_action(
+        action, state = constrained_pick_place_expert_action(
             obs,
             state,
             target_cube_pos,
@@ -150,6 +154,7 @@ while attempts <2*target_successes and num_success < target_successes:
             # "image": img,
             "action": action.copy(),
             "expert_state": state_before_action,
+            "expert_route": ctx["route"],
         })
 
         obs, reward, done, info = env.step(action)
@@ -167,22 +172,26 @@ while attempts <2*target_successes and num_success < target_successes:
                 grasped,
             )
         
-        xy_error = np.linalg.norm(
-            obs["cube_pos"][:2] - target_cube_pos[:2]
-        )
-    
-        z_error = abs(
-            obs["cube_pos"][2] - target_cube_pos[2]
-        )
-    
+        target_half_size = obs["target_half_size"]
+        x_in_target = abs(obs["cube_pos"][0] - target_cube_pos[0]) < target_half_size[0]
+        y_in_target = abs(obs["cube_pos"][1] - target_cube_pos[1]) < target_half_size[1]
+        z_error = abs(obs["cube_pos"][2] - target_cube_pos[2])
+
         success = (
             state == "DONE"
-            and xy_error < 0.025
+            and x_in_target
+            and y_in_target
             and z_error < 0.025
         )
     
         if success:
             print("SUCCESS at step", t)
+            break
+        if done:
+            print(
+                f"Episode terminated at step {t}, "
+                f"state={state}, route={ctx['route']}"
+            )
             break
 
     if success:
@@ -200,7 +209,7 @@ while attempts <2*target_successes and num_success < target_successes:
     with open(f"{data_folder}/demo_{attempts-1:03d}.pkl", "wb") as f:
         pickle.dump(data, f)
 
-    print(f"Episode {attempts}: steps={len(trajectory)}, success={success}")
+    print(f"Episode {attempts}: steps={len(trajectory)}, success={success}, route={ctx['route']}")
 
 print(f"\nSummary: {num_success}/{attempts} successful")
 print(f"Trajectory lengths: min={min(trajectory_lengths)}, max={max(trajectory_lengths)}")

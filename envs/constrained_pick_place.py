@@ -18,8 +18,9 @@ class ConstrainedPickPlace(Lift):
 
     def __init__(
         self,
-        barrier_pos=(0.0, 0.04, 0.92),
-        barrier_half_size=(0.12, 0.015, 0.12),
+        barrier_pos=(0.0, 0.14, 0.92),
+        barrier_half_size=(0.10, 0.015, 0.12),
+        target_half_size=(0.045, 0.045),
         table_z=0.8,
         *args,
         **kwargs,
@@ -33,6 +34,11 @@ class ConstrainedPickPlace(Lift):
 
         self.barrier_half_size = np.array(
             barrier_half_size,
+            dtype=np.float64,
+        )
+
+        self.target_half_size = np.array(
+            target_half_size,
             dtype=np.float64,
         )
 
@@ -115,13 +121,19 @@ class ConstrainedPickPlace(Lift):
             },
         )
 
+        marker_half_size = np.array([
+            self.target_half_size[0],
+            self.target_half_size[1],
+            0.002,
+        ])
+
         ET.SubElement(
             target_body,
             "geom",
             attrib={
                 "name": "target_marker_geom",
                 "type": "box",
-                "size": "0.045 0.045 0.002",
+                "size": self._vec_to_str(marker_half_size),
                 "rgba": "0.1 0.8 0.1 0.7",
                 # Visible
                 "group": "1",
@@ -151,6 +163,10 @@ class ConstrainedPickPlace(Lift):
         def barrier_half_size(obs_cache):
             return self.barrier_half_size.astype(np.float32)
 
+        @sensor(modality="object")
+        def target_half_size(obs_cache):
+            return self.target_half_size.astype(np.float32)
+
         observables["target_pos"] = Observable(
             name="target_pos",
             sensor=target_pos,
@@ -166,6 +182,12 @@ class ConstrainedPickPlace(Lift):
         observables["barrier_half_size"] = Observable(
             name="barrier_half_size",
             sensor=barrier_half_size,
+            sampling_rate=self.control_freq,
+        )
+
+        observables["target_half_size"] = Observable(
+            name="target_half_size",
+            sensor=target_half_size,
             sampling_rate=self.control_freq,
         )
 
