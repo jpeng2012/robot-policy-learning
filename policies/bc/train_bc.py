@@ -1,8 +1,18 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader, random_split
+from torch.utils.data import TensorDataset, DataLoader, random_split, WeightedRandomSampler
 
+
+STATE_TO_ID = {
+    "APPROACH": 0,
+    "DESCEND": 1,
+    "GRASP": 2,
+    "LIFT": 3,
+    "TRANSPORT": 4,
+    "LOWER": 5,
+    "RELEASE": 6,
+}
 
 # ---------------------------------------------------------
 # Config
@@ -26,6 +36,7 @@ data = np.load(dataset_path)
 
 X_train = data["X_train"].astype(np.float32)
 Y_train = data["Y_one_train"].astype(np.float32)
+state_train = data["state_train"].astype(np.int64)
 
 X_val = data["X_val"].astype(np.float32)
 Y_val = data["Y_one_val"].astype(np.float32)
@@ -35,6 +46,26 @@ print("Y_train:", Y_train.shape)
 print("X_val:", X_val.shape)
 print("Y_val:", Y_val.shape)
 
+state_counts = np.bincount(
+    state_train,
+    minlength=len(STATE_TO_ID),
+)
+
+print("state counts:", state_counts)
+
+class_weights = 1.0 / np.sqrt(state_counts)
+
+sample_weights = class_weights[state_train]
+
+sample_weights = torch.from_numpy(
+    sample_weights
+).double()
+
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(sample_weights),
+    replacement=True,
+)
 
 # ---------------------------------------------------------
 # Normalize input
@@ -50,6 +81,7 @@ X_val = (X_val - x_mean) / x_std
 train_set = TensorDataset(
     torch.from_numpy(X_train),
     torch.from_numpy(Y_train),
+    torch.from_numpy(state_train),
 )
 
 val_set = TensorDataset(
@@ -61,6 +93,7 @@ train_loader = DataLoader(
     train_set,
     batch_size=batch_size,
     shuffle=True,
+    # sampler=sampler,
 )
 
 val_loader = DataLoader(
@@ -69,6 +102,15 @@ val_loader = DataLoader(
     shuffle=False,
 )
 
+STATE_WEIGHT = torch.tensor([
+    1.0,   # APPROACH
+    1.0,   # DESCEND
+    1.0,   # GRASP
+    1.0,   # LIFT
+    0.6,   # TRANSPORT
+    1.0,   # LOWER
+    1.5,   # RELEASE
+], dtype=torch.float32, device=device)
 
 # ---------------------------------------------------------
 # Policy
@@ -121,19 +163,23 @@ for epoch in range(num_epochs):
 
     train_loss = 0.0
 
-    for x, y in train_loader:
+    for x, y, state_id in train_loader:
 
         x = x.to(device)
         y = y.to(device)
+        state_id = state_id.to(device)
+        weights = STATE_WEIGHT[state_id]
 
         pred = policy(x)
 
-        loss = criterion(
-            pred,
-            y,
-        )
+        # loss = criterion(
+        #     pred,
+        #     y,
+        # )
+        loss_per_sample = ((pred - y) ** 2).mean(dim=1)
 
         optimizer.zero_grad()
+        loss = (loss_per_sample * weights).mean()
 
         loss.backward()
 
@@ -188,7 +234,7 @@ torch.save(
     {
         "model_state_dict": policy.state_dict(),
 
-        "x_mean": torch.from_numpy(x_mean),,
+        "x_mean": torch.from_numpy(x_mean),
         "x_std": torch.from_numpy(x_std),
 
         "input_dim": X_train.shape[1],

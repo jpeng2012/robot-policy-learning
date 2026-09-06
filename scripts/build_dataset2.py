@@ -14,6 +14,15 @@ action_horizon = 16
 val_ratio = 0.1
 seed = 42
 
+STATE_TO_ID = {
+    "APPROACH": 0,
+    "DESCEND": 1,
+    "GRASP": 2,
+    "LIFT": 3,
+    "TRANSPORT": 4,
+    "LOWER": 5,
+    "RELEASE": 6,
+}
 
 def make_feature(step):
     obs = step["obs"]
@@ -25,7 +34,7 @@ def make_feature(step):
         obs["target_pos"],          # 3
         obs["barrier_pos"],         # 3
         obs["barrier_half_size"],   # 3
-        obs["prev_action"],         # 7
+        # obs["prev_action"],         # 7
     ]).astype(np.float32)
 
 
@@ -44,6 +53,7 @@ def build_samples(files):
     all_y_one = []
     all_y_chunk = []
     all_routes = []
+    all_states = []
 
     for file in files:
 
@@ -113,15 +123,40 @@ def build_samples(files):
             all_y_one.append(y_one)
             all_y_chunk.append(y_chunk)
 
+            state = traj[t]["expert_state"]
+            
+            all_states.append(
+                STATE_TO_ID[state]
+            )
+
             # Metadata only
             all_routes.append(
                 0 if route == "LEFT" else 1
             )
 
+    all_y_one = np.stack(all_y_one)
+
+    for state_name, state_id in STATE_TO_ID.items():
+
+        mask = np.array(all_states) == state_id
+
+        if mask.sum() == 0:
+            continue
+
+        actions = all_y_one[mask]
+
+        print(
+            state_name,
+            "N =", mask.sum(),
+            "mean action =",
+            np.round(actions.mean(axis=0), 3),
+        )
+
     return (
         np.stack(all_x),
-        np.stack(all_y_one),
+        all_y_one,
         np.stack(all_y_chunk),
+        np.stack(all_states),
         np.asarray(all_routes, dtype=np.int64),
     )
 
@@ -199,6 +234,7 @@ print(
     X_train,
     Y_one_train,
     Y_chunk_train,
+    state_train,
     route_train,
 ) = build_samples(train_files)
 
@@ -206,6 +242,7 @@ print(
     X_val,
     Y_one_val,
     Y_chunk_val,
+    state_val,
     route_val,
 ) = build_samples(val_files)
 
@@ -238,11 +275,13 @@ np.savez_compressed(
     Y_one_train=Y_one_train,
     Y_chunk_train=Y_chunk_train,
     route_train=route_train,
+    state_train=state_train,
 
     X_val=X_val,
     Y_one_val=Y_one_val,
     Y_chunk_val=Y_chunk_val,
     route_val=route_val,
+    state_val=state_val,
 )
 
 print("\nSaved data/level2_dataset.npz")

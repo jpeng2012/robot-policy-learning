@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+*.pth
 
 # Virtual environments
 venv/
@@ -19,3 +20,5 @@ env/
 .vscode/
 .idea/
 .claude/
+
+develop.md

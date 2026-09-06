@@ -74,7 +74,7 @@ class BCPolicy(nn.Module):
 def make_feature(
     obs,
     target_cube_pos,
-    prev_action,
+    # prev_action,
 ):
     return np.concatenate([
         obs["robot0_eef_pos"],        # 3
@@ -83,7 +83,7 @@ def make_feature(
         target_cube_pos,              # 3
         obs["barrier_pos"],           # 3
         obs["barrier_half_size"],     # 3
-        prev_action,                  # 7
+        # prev_action,                  # 7
     ]).astype(np.float32)
 
 
@@ -160,8 +160,8 @@ checkpoint = torch.load(
     weights_only=False,
 )
 
-x_mean = checkpoint["x_mean"].astype(np.float32)
-x_std = checkpoint["x_std"].astype(np.float32)
+x_mean = checkpoint["x_mean"].cpu().numpy()
+x_std = checkpoint["x_std"].cpu().numpy()
 
 input_dim = checkpoint["input_dim"]
 action_dim = checkpoint["action_dim"]
@@ -259,7 +259,7 @@ for episode in range(num_episodes):
     first_feature = make_feature(
         obs,
         target_cube_pos,
-        prev_action,
+        # prev_action,
     )
 
     for _ in range(history_len):
@@ -351,7 +351,7 @@ for episode in range(num_episodes):
         feature = make_feature(
             obs,
             target_cube_pos,
-            prev_action,
+            # prev_action,
         )
 
         history.append(
