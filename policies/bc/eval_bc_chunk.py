@@ -30,40 +30,48 @@ device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-checkpoint_path = "policies/bc/bc_level2.pth"
+checkpoint_path = "policies/bc/bc_level2_chunk.pth"
 
 num_episodes = 10
 max_steps = 500
 history_len = 4
 
+prediction_horizon = 16
+execution_horizon = 4
+
 has_renderer = True
 
 
 # ============================================================
-# BC model
+# BC chunk model
 # ============================================================
 
-class BCPolicy(nn.Module):
-
-    def __init__(self, input_dim=96, action_dim=7):
+class ChunkBCPolicy(nn.Module):
+    def __init__(self, input_dim=68, horizon=16, action_dim=7):
         super().__init__()
+
+        self.horizon = horizon
+        self.action_dim = action_dim
 
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
-
             nn.Linear(256, 256),
             nn.ReLU(),
-
-            nn.Linear(256, 128),
+            nn.Linear(256, 256),
             nn.ReLU(),
-
-            nn.Linear(128, action_dim),
+            nn.Linear(256, horizon * action_dim),
             nn.Tanh(),
         )
 
     def forward(self, x):
-        return self.net(x)
+        y = self.net(x)
+
+        return y.view(
+            x.shape[0],
+            self.horizon,
+            self.action_dim,
+        )
 
 
 # ============================================================
@@ -166,9 +174,11 @@ x_std = checkpoint["x_std"].cpu().numpy()
 input_dim = checkpoint["input_dim"]
 action_dim = checkpoint["action_dim"]
 
-policy = BCPolicy(
+
+policy = ChunkBCPolicy(
     input_dim=input_dim,
     action_dim=action_dim,
+    horizon=prediction_horizon,
 ).to(device)
 
 policy.load_state_dict(
@@ -308,15 +318,15 @@ for episode in range(num_episodes):
         # ----------------------------------------------------
 
         with torch.no_grad():
-            action = (
+            action_chunk = (
                 policy(x_tensor)
                 .squeeze(0)
                 .cpu()
                 .numpy()
             )
 
-        action = np.clip(
-            action,
+        action_chunk = np.clip(
+            action_chunk,
             -1.0,
             1.0,
         )
@@ -325,38 +335,40 @@ for episode in range(num_episodes):
         # Step environment
         # ----------------------------------------------------
 
-        obs, reward, done, info = env.step(
-            action
-        )
+        for i in range(execution_horizon):
+            action = action_chunk[i, :].squeeze(0).copy()
+            obs, reward, done, info = env.step(
+                action
+            )
 
-        if has_renderer:
-            env.render()
+            if has_renderer:
+                env.render()
 
-        prev_action = action.copy()
+            prev_action = action.copy()
 
-        cube_pos = obs["cube_pos"].copy()
+            cube_pos = obs["cube_pos"].copy()
 
-        cube_x_history.append(
-            cube_pos[0]
-        )
+            cube_x_history.append(
+                cube_pos[0]
+            )
 
-        cube_y_history.append(
-            cube_pos[1]
-        )
+            cube_y_history.append(
+                cube_pos[1]
+            )
 
-        # ----------------------------------------------------
-        # Update history
-        # ----------------------------------------------------
+            # ----------------------------------------------------
+            # Update history
+            # ----------------------------------------------------
 
-        feature = make_feature(
-            obs,
-            target_cube_pos,
-            # prev_action,
-        )
+            feature = make_feature(
+                obs,
+                target_cube_pos,
+                # prev_action,
+            )
 
-        history.append(
-            feature
-        )
+            history.append(
+                feature
+            )
 
         # ----------------------------------------------------
         # Catastrophic invalid state
