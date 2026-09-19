@@ -247,7 +247,7 @@ proprio_std = np.asarray(
 )
 
 action_horizon = 16
-execution_horizon = 4
+execution_horizon = 2
 
 policy = VisionChunkBCModel(
     vision_history_len=vision_history_len,

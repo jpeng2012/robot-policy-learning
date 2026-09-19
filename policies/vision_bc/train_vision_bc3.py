@@ -278,7 +278,7 @@ for epoch in range(num_epochs):
                 reduction="none",
             )
 
-            loss_per_sample = motion_loss + 0.5*gripper_loss
+            loss_per_sample = motion_loss + 1.1*gripper_loss
             val_loss += (loss_per_sample * weights).mean().item() * agent.size(0)
 
     val_loss /= len(val_dataset)

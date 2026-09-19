@@ -74,7 +74,7 @@ class VisionChunkBCModel(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 batch_size = 128
-num_epochs = 30
+num_epochs = 20
 vision_history_len = 1
 proprio_history_len = 4
 
@@ -96,9 +96,9 @@ STATE_WEIGHT = torch.tensor([
     1.0,   # DESCEND
     1.0,   # GRASP
     1.0,   # LIFT
-    0.6,   # TRANSPORT
+    0.5,   # TRANSPORT
     1.0,   # LOWER
-    1.5,   # RELEASE
+    2.0,   # RELEASE
 ], dtype=torch.float32, device=device)
 
 weights = ResNet18_Weights.DEFAULT
@@ -201,6 +201,15 @@ for epoch in range(num_epochs):
     torch.cuda.reset_peak_memory_stats()
 
     policy.train()
+
+    # Keep frozen ResNet parts' BatchNorm stats fixed
+    policy.agent_encoder.eval()
+    policy.wrist_encoder.eval()
+
+    # Fine-tuned final stage
+    policy.agent_encoder.layer4.train()
+    policy.wrist_encoder.layer4.train()
+
     train_loss = 0.0
 
     t0 = time.time()
@@ -234,7 +243,7 @@ for epoch in range(num_epochs):
         ).mean(1)
         # print(motion_loss.shape)
         # print(gripper_loss.shape)
-        loss_per_sample = motion_loss + 0.5*gripper_loss
+        loss_per_sample = motion_loss + 1.1*gripper_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss = (loss_per_sample * weights).mean()
@@ -284,7 +293,7 @@ for epoch in range(num_epochs):
                 reduction="none",
             ).mean(dim=1)
 
-            loss_per_sample = motion_loss + 0.5*gripper_loss
+            loss_per_sample = motion_loss + 1.1*gripper_loss
             val_loss += (loss_per_sample * weights).mean().item() * agent.size(0)
 
     val_loss /= len(val_dataset)
