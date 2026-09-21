@@ -22,8 +22,9 @@ if PROJECT_ROOT not in sys.path:
 
 from policies.vision_bc.dataset import VisionChunkBCDataset
 
+from policies.common.observation_encoder import ObservationEncoder
+
 from policies.diffusion.model import (
-    ObservationEncoder,
     ActionDenoiser,
 )
 
@@ -200,7 +201,7 @@ def diffusion_loss(
     k = torch.randint(
         low=0, 
         high=schedule.num_steps,
-        size= (B, )
+        size= (B, ),
         device=device
     )
 
@@ -356,9 +357,9 @@ for epoch in range(num_epochs):
     # Save best
     # --------------------------------------------------------
 
-    if val_loss < best_val_loss:
+    if val_loss < best_eval_loss:
 
-        best_val_loss = val_loss
+        best_eval_loss = val_loss
 
         torch.save(
             {
