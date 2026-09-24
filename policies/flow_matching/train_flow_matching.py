@@ -11,7 +11,7 @@ from torchvision.models import (
 import torch.nn.functional as F
 
 from policies.common.observation_encoder_spatial import ObservationEncoder
-from policies.act.model_spatial import ACTPolicy
+from policies.flow_matching.model import FlowMatchingPolicy
 
 # ============================================================
 # Config
@@ -33,29 +33,27 @@ action_dim = 7
 condition_dim = 256
 hidden_dim = 512
 
-latent_dim = 16
 
 num_encoder_layer=4
 num_decoder_layer=4
 num_heads=8
 
-dim_feedforward=3200
+dim_feedforward=2048
 
 num_workers = 8
 kl_weight = 1.0
 
 
-encoder_lr = 5e-5
+encoder_lr = 2e-5
 projector_lr = 1e-4
-latent_encoder_lr = 1e-5
-decoder_lr = 1e-5
+decoder_lr = 1e-4
 
-agent_feat_dim = 512 * vision_history_len
-wrist_feat_dim = 512 * vision_history_len
+agent_feat_dim = 512 # ? 
+wrist_feat_dim = 512
 proprio_feat_dim = proprio_dim * proprio_history_len
 
 dataset_path = "data/level3_hist_1_4_dataset.npz"
-save_path0 = "policies/act/act_1_4"
+save_path0 = "policies/flow_matching/flowmatching_1_4"
 
 STATE_TO_ID = {
     "APPROACH": 0,
@@ -157,24 +155,18 @@ obs_encoder = ObservationEncoder(
 ).to(device)
 
 
-policy = ACTPolicy(
+policy = FlowMatchingPolicy(
     observation_encoder=obs_encoder,
-    conditon_dim=condition_dim,
     agent_feat_dim=agent_feat_dim,
     wrist_feat_dim=wrist_feat_dim,
     proprio_feat_dim=proprio_feat_dim,
     action_dim=action_dim,
     action_horizon=action_horizon,
     hidden_dim=hidden_dim,
-    latent_dim=latent_dim,
-    num_encoder_layer=num_encoder_layer,
-    num_decoder_layer=num_decoder_layer,
+    num_layers=num_decoder_layer,
     num_heads=num_heads,
     dim_feedforward=dim_feedforward,
 ).to(device)
-
-
-
 
 # fine-tune the ResNets, but with a lower LR on the encoders than on the MLP head:
 optimizer = torch.optim.AdamW([
@@ -191,26 +183,15 @@ optimizer = torch.optim.AdamW([
         "lr": projector_lr,
     },
     {
-        "params": policy.latent_encoder.parameters(),
-        "lr": latent_encoder_lr,
-    },
-    {
-        "params": policy.decoder.parameters(),
+        "params": policy.flow_decoder.parameters(),
         "lr": decoder_lr,
     }
 ])
 
 best_eval_loss = float('inf')
-target_kl_weight = 3
-warmup_epochs = 3
 
 
 for epoch in range(num_epochs):
-
-    kl_weight = target_kl_weight * min(
-        1.0,
-        (epoch + 1) / warmup_epochs,
-    )
 
     torch.cuda.reset_peak_memory_stats()
 
@@ -239,45 +220,103 @@ for epoch in range(num_epochs):
 
         weights = STATE_WEIGHT[state_id]
 
-        pred_chunk, mu, logvar = policy(
+        B = target_chunk.shape[0]
+
+        # ------------------------------------------------------
+        # x1 = expert action trajectory
+        # ------------------------------------------------------
+
+        x1 = target_chunk[..., :action_dim-1]
+
+        gripper_target = (
+            target_chunk[..., action_dim-1] > 0
+        ).float()
+        # print(gripper_target.shape)
+
+        # ------------------------------------------------------
+        # x0 = random Gaussian action trajectory
+        # ------------------------------------------------------
+
+        x0 = torch.randn_like(x1)
+
+        # ------------------------------------------------------
+        # random flow time
+        # ------------------------------------------------------
+
+        t = torch.rand(
+            B,
+            device=x1.device,
+        )
+
+        t_expand = t[:, None, None]
+
+        # ------------------------------------------------------
+        # interpolation
+        #
+        # t=0 -> noise
+        # t=1 -> expert
+        # ------------------------------------------------------
+
+        xt = (
+            (1.0 - t_expand) * x0
+            + t_expand * x1
+        )
+
+        # ------------------------------------------------------
+        # velocity target
+        # ------------------------------------------------------
+
+        target_velocity = x1 - x0
+
+        # ------------------------------------------------------
+        # model
+        # ------------------------------------------------------
+
+        pred_velocity, gripper_logits = policy(
             agent,
             wrist,
             proprio,
-            action_chunk=target_chunk,
+            noisy_actions=xt,
+            t=t,
         )
 
-        pred_motion = pred_chunk[..., :6]
-        pred_gripper = pred_chunk[..., 6]
+        # ------------------------------------------------------
+        # basic FM loss
+        # ------------------------------------------------------
 
-        target_motion = target_chunk[..., :6]
-        target_gripper = (
-            target_chunk[..., 6] > 0
-        ).float()
+        motion_loss = F.mse_loss(
+            pred_velocity,
+            target_velocity,
+            reduction="none",
+        ).mean(dim=(1, 2))
 
-        motion_loss = F.l1_loss(
-                pred_motion,
-                target_motion,
-                reduction="none",
-            ).mean(dim=(1, 2))
         gripper_loss = F.binary_cross_entropy_with_logits(
-            pred_gripper,
-            target_gripper,
+            gripper_logits,
+            gripper_target,
             reduction="none",
         ).mean(1)
-        # print(motion_loss.shape)
-        # print(gripper_loss.shape)
-        action_loss_per_sample = motion_loss + 1.1*gripper_loss        
-        action_loss = (action_loss_per_sample * weights).mean()
-        kl_per_sample = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
-        kl_loss = kl_per_sample.mean()
-        loss = action_loss + kl_weight * kl_loss
+        
+        loss_per_sample = motion_loss + 1.1*gripper_loss
 
+        loss = (loss_per_sample * weights).mean()
+       
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
         optimizer.step()
 
         train_loss += loss.item() * agent.size(0)
+
+        err = (
+            pred_velocity - target_velocity
+        ).pow(2)
+
+        xyz_loss = err[..., :3].mean()
+        rot_loss = err[..., 3:6].mean()
+
+        x_loss = err[..., 0].mean()
+        y_loss = err[..., 1].mean()
+        z_loss = err[..., 2].mean()
 
         if batch_idx % 100 == 0:
             print(
@@ -286,9 +325,11 @@ for epoch in range(num_epochs):
                 f"loss={loss.item():.5f} "
                 f"motion={motion_loss.mean().item():.5f} "
                 f"gripper={gripper_loss.mean().item():.5f} "
-                f"action={action_loss.item():.5f} "
-                f"kl={kl_loss.item():.5f} "
-                f"weighted_kl={(kl_weight * kl_loss).item():.5f}"
+                f"xyz={xyz_loss.item():.5f} "
+                f"rot={rot_loss.item():.5f} "
+                f"x={x_loss.item():.5f} "
+                f"y={y_loss.item():.5f} "
+                f"z={z_loss.item():.5f} "
                 f"batch_time={time.time()-batch_start:.2f}s")
 
     train_loss /= len(train_dataset)
@@ -297,6 +338,10 @@ for epoch in range(num_epochs):
     policy.eval()
     obs_encoder.eval()
     val_loss = 0.0
+
+    generator = torch.Generator(
+        device=device
+    ).manual_seed(1234)
 
     with torch.no_grad():
         for batch in val_loader:
@@ -308,39 +353,91 @@ for epoch in range(num_epochs):
 
             weights = STATE_WEIGHT[state_id]
 
-            pred_chunk, mu, logvar = policy(
+            B = target_chunk.shape[0]
+            
+            # ------------------------------------------------------
+            # x1 = expert action trajectory
+            # ------------------------------------------------------
+    
+            x1 = target_chunk[..., :action_dim-1]
+            
+            gripper_target = (
+                target_chunk[..., action_dim-1] > 0
+            ).float()
+    
+            # ------------------------------------------------------
+            # x0 = random Gaussian action trajectory
+            # ------------------------------------------------------
+    
+            
+
+            x0 = torch.randn(
+                x1.shape,
+                device=x1.device,
+                generator=generator,
+            )
+    
+            # ------------------------------------------------------
+            # random flow time
+            # ------------------------------------------------------
+    
+            t = torch.rand(
+                B,
+                device=x1.device,
+                generator=generator,
+            )
+    
+            t_expand = t[:, None, None]
+    
+            # ------------------------------------------------------
+            # interpolation
+            #
+            # t=0 -> noise
+            # t=1 -> expert
+            # ------------------------------------------------------
+    
+            xt = (
+                (1.0 - t_expand) * x0
+                + t_expand * x1
+            )
+    
+            # ------------------------------------------------------
+            # velocity target
+            # ------------------------------------------------------
+    
+            target_velocity = x1 - x0
+    
+            # ------------------------------------------------------
+            # model
+            # ------------------------------------------------------
+    
+            pred_velocity, gripper_logits = policy(
                 agent,
                 wrist,
                 proprio,
-                action_chunk=target_chunk,
+                noisy_actions=xt,
+                t=t,
             )
-           
-            
-            pred_motion = pred_chunk[..., :6]
-            pred_gripper = pred_chunk[..., 6]
     
-            target_motion = target_chunk[..., :6]
-            target_gripper = (
-                target_chunk[..., 6] > 0
-            ).float()
+            # ------------------------------------------------------
+            # basic FM loss
+            # ------------------------------------------------------
     
-            motion_loss = F.l1_loss(
-                pred_motion,
-                target_motion,
+            motion_loss = F.mse_loss(
+                pred_velocity,
+                target_velocity,
                 reduction="none",
             ).mean(dim=(1, 2))
-
+    
             gripper_loss = F.binary_cross_entropy_with_logits(
-                pred_gripper,
-                target_gripper,
+                gripper_logits,
+                gripper_target,
                 reduction="none",
-            ).mean(dim=1)
-
-            action_loss_per_sample = motion_loss + 1.1*gripper_loss        
-            action_loss = (action_loss_per_sample * weights).mean()
-            kl_per_sample = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
-            kl_loss = kl_per_sample.mean()
-            loss = action_loss + kl_weight * kl_loss
+            ).mean(1)
+            
+            loss_per_sample = motion_loss + 1.1*gripper_loss
+    
+            loss = (loss_per_sample * weights).mean()
             val_loss += loss.item() * agent.size(0)
 
     val_loss /= len(val_dataset)
@@ -390,9 +487,6 @@ for epoch in range(num_epochs):
                     "action_dim":
                         action_dim,
 
-                    "latent_dim":
-                        latent_dim,
-    
                     "condition_dim":
                         condition_dim,
     

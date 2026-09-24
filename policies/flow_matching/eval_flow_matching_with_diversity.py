@@ -12,7 +12,7 @@ from torchvision.models import resnet18, ResNet18_Weights
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
 from policies.common.observation_encoder_spatial import ObservationEncoder
-from policies.act.model_spatial import ACTPolicy
+from policies.flow_matching.model import FlowMatchingPolicy
 
 # ============================================================
 # Project imports
@@ -36,10 +36,10 @@ device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-checkpoint_path = "policies/act/act_1_4_3.pth"
+checkpoint_path = "policies/flow_matching/flowmatching_1_4_ep019.pth"
 
-num_episodes = 30
-max_steps = 700
+num_episodes = 20
+max_steps = 500
 
 has_renderer = True
 
@@ -154,6 +154,24 @@ def make_proprio(obs):
     ]).astype(np.float32)
 
 
+def shift_noise(prev_x0, execute_horizon):
+    B, H, D = prev_x0.shape
+
+    tail = torch.randn(
+        B,
+        execute_horizon,
+        D,
+        device=prev_x0.device,
+    )
+
+    return torch.cat(
+        [
+            prev_x0[:, execute_horizon:],
+            tail,
+        ],
+        dim=1,
+    )
+
 # ============================================================
 # Load checkpoint
 # ============================================================
@@ -186,13 +204,6 @@ action_horizon = int(
     checkpoint.get(
         "action_horizon",
         16,
-    )
-)
-
-latent_dim = int(
-    checkpoint.get(
-        "latent_dim",
-        32,
     )
 )
 
@@ -252,7 +263,13 @@ num_heads = int(
     )
 )
 
-execution_horizon = 4
+execution_horizon = 2
+run_diversity_diagnostics = True
+num_diversity_samples = 50
+diversity_seed = 20260922
+route_action_dim = 0
+flow_num_steps = 10
+diversity_records = []
 
 agent_encoder = resnet18(
     weights=weights
@@ -281,22 +298,18 @@ agent_feat_dim = 512 * vision_history_len
 wrist_feat_dim = 512 * vision_history_len
 proprio_feat_dim = proprio_dim * proprio_history_len
 
-policy = ACTPolicy(
+policy = FlowMatchingPolicy(
     observation_encoder=obs_encoder,
-    conditon_dim=condition_dim,
     agent_feat_dim=agent_feat_dim,
     wrist_feat_dim=wrist_feat_dim,
     proprio_feat_dim=proprio_feat_dim,
     action_dim=action_dim,
     action_horizon=action_horizon,
     hidden_dim=hidden_dim,
-    latent_dim=latent_dim,
-    num_encoder_layer=num_encoder_layer,
-    num_decoder_layer=num_decoder_layer,
+    num_layers=num_decoder_layer,
     num_heads=num_heads,
     dim_feedforward=dim_feedforward,
 ).to(device)
-
 
 policy.load_state_dict(
     checkpoint["policy_state_dict"]
@@ -310,6 +323,89 @@ print("device:", device)
 print("vision_history_len:", vision_history_len)
 print("proprio_history_len:", proprio_history_len)
 
+# ============================================================
+# Flow-matching diversity diagnostics
+# ============================================================
+@torch.no_grad()
+def sample_chunks_over_x0(
+    policy,
+    agent_tensor,
+    wrist_tensor,
+    proprio_tensor,
+    num_samples,
+    seed,
+    num_steps,
+):
+    """Fix observation o and vary only Flow Matching initial noise x0."""
+    agent_batch = agent_tensor.expand(num_samples, *agent_tensor.shape[1:])
+    wrist_batch = wrist_tensor.expand(num_samples, *wrist_tensor.shape[1:])
+    proprio_batch = proprio_tensor.expand(num_samples, *proprio_tensor.shape[1:])
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        chunks = policy.sample_actions(
+            agent_batch,
+            wrist_batch,
+            proprio_batch,
+            num_steps=num_steps,
+        )
+    return chunks
+
+@torch.no_grad()
+def compute_flow_diversity(
+    policy,
+    agent_tensor,
+    wrist_tensor,
+    proprio_tensor,
+    num_samples,
+    seed,
+    num_steps,
+    route_dim=0,
+):
+    chunks = sample_chunks_over_x0(
+        policy,
+        agent_tensor,
+        wrist_tensor,
+        proprio_tensor,
+        num_samples,
+        seed,
+        num_steps,
+    )
+    motion = chunks[..., :6]
+    motion_var_hd = motion.var(dim=0, unbiased=False)
+    mean_motion_var = motion_var_hd.mean().item()
+    route_score = motion[:, :, route_dim].sum(dim=1)
+    route_score_mean = route_score.mean().item()
+    route_score_std = route_score.std(unbiased=False).item()
+    q_levels = torch.tensor(
+        [0.10, 0.25, 0.50, 0.75, 0.90],
+        device=route_score.device,
+        dtype=route_score.dtype,
+    )
+    q = torch.quantile(route_score, q_levels).cpu().numpy()
+    flat = motion.flatten(1)
+    pairwise = torch.cdist(flat, flat, p=2)
+    n = flat.shape[0]
+    upper = torch.triu(
+        torch.ones(n, n, dtype=torch.bool, device=flat.device),
+        diagonal=1,
+    )
+    pairwise_chunk_dist = pairwise[upper].mean().item() if n > 1 else 0.0
+    per_dim_var = motion_var_hd.mean(dim=0).cpu().numpy()
+    return {
+        "mean_motion_var": mean_motion_var,
+        "route_score_mean": route_score_mean,
+        "route_score_std": route_score_std,
+        "route_q10": float(q[0]),
+        "route_q25": float(q[1]),
+        "route_q50": float(q[2]),
+        "route_q75": float(q[3]),
+        "route_q90": float(q[4]),
+        "pairwise_chunk_dist": pairwise_chunk_dist,
+        "per_dim_var": per_dim_var,
+    }
 
 # ============================================================
 # Evaluation statistics
@@ -355,6 +451,7 @@ for episode in range(num_episodes):
 
     was_lifted = False
     ever_grasped = False
+    diversity_collected = False
 
     cube_x_history = []
 
@@ -455,14 +552,28 @@ for episode in range(num_episodes):
         # ----------------------------------------------------
 
         with torch.no_grad():
-
-            action_chunk, _, _ = policy(
-                    agent_tensor,
-                    wrist_tensor,
-                    proprio_tensor,
+            if t==0:
+                # start with Gaussian noise
+                x = torch.randn(
+                    agent_tensor.shape[0],
+                    action_horizon,
+                    action_dim-1,
+                    device=agent_tensor.device,
+                    dtype=agent_tensor.dtype,
                 )
-            action_chunk = action_chunk.squeeze(0).cpu().numpy()
+            else:
+                x = shift_noise(x, execution_horizon)
+                # x = x
+
+            action_chunk = policy.sample_actions_with_x(
+                agent_tensor,
+                wrist_tensor,
+                proprio_tensor,
+                x,
+                num_steps=10,
+            )
             
+            action_chunk = action_chunk[0].cpu().numpy()
 
         action_chunk[:, 6] = np.where(
             action_chunk[:, 6] > 0,
@@ -474,7 +585,6 @@ for episode in range(num_episodes):
             action_horizon,
             7,
         )
-        
         action_chunk = np.clip(
             action_chunk,
             -1.0,
@@ -583,6 +693,58 @@ for episode in range(num_episodes):
                 > initial_cube_z + 0.05
             ):
                 was_lifted = True
+
+            if (
+                run_diversity_diagnostics
+                and was_lifted
+                and not diversity_collected
+            ):
+                diag_agent = torch.stack(
+                    list(agent_history),
+                    dim=0,
+                ).unsqueeze(0).to(device, non_blocking=True)
+                diag_wrist = torch.stack(
+                    list(wrist_history),
+                    dim=0,
+                ).unsqueeze(0).to(device, non_blocking=True)
+                diag_proprio = torch.from_numpy(
+                    np.stack(list(proprio_history), axis=0)
+                ).unsqueeze(0).to(device, non_blocking=True)
+                diag = compute_flow_diversity(
+                    policy,
+                    diag_agent,
+                    diag_wrist,
+                    diag_proprio,
+                    num_samples=num_diversity_samples,
+                    seed=diversity_seed,
+                    num_steps=flow_num_steps,
+                    route_dim=route_action_dim,
+                )
+                diag["episode"] = episode
+                diag["step"] = t
+                diversity_records.append(diag)
+                diversity_collected = True
+                pdv = diag["per_dim_var"]
+                print(
+                    f"\n[FM diversity] episode={episode} step={t} "
+                    f"N_x0={num_diversity_samples} "
+                    f"motion_var={diag['mean_motion_var']:.6f} "
+                    f"route_mean={diag['route_score_mean']:+.4f} "
+                    f"route_std={diag['route_score_std']:.4f} "
+                    f"pairwise={diag['pairwise_chunk_dist']:.4f}"
+                )
+                print(
+                    f"  route q10={diag['route_q10']:+.3f} "
+                    f"q25={diag['route_q25']:+.3f} "
+                    f"q50={diag['route_q50']:+.3f} "
+                    f"q75={diag['route_q75']:+.3f} "
+                    f"q90={diag['route_q90']:+.3f}"
+                )
+                print(
+                    f"  motion Var_x0 x={pdv[0]:.6f} "
+                    f"y={pdv[1]:.6f} z={pdv[2]:.6f} "
+                    f"r0={pdv[3]:.6f} r1={pdv[4]:.6f} r2={pdv[5]:.6f}"
+                )
 
             # ====================================================
             # Success geometry
@@ -769,7 +931,7 @@ for episode in range(num_episodes):
 # ============================================================
 
 print("\n==============================")
-print("ACT Evaluation")
+print("Flow Matching Evaluation")
 print("==============================")
 
 print(
@@ -811,5 +973,38 @@ if trajectory_lengths:
         f"{np.max(trajectory_lengths)}"
     )
 
+
+if run_diversity_diagnostics:
+    print("\n==============================")
+    print("Flow Matching Diversity Diagnostics")
+    print("==============================")
+    if diversity_records:
+        def _mean(key):
+            return float(np.mean([r[key] for r in diversity_records]))
+        per_dim = np.stack([r["per_dim_var"] for r in diversity_records]).mean(axis=0)
+        print("Observations analyzed:", len(diversity_records))
+        print("Fixed x0 samples / observation:", num_diversity_samples)
+        print(f"Mean Var_x0[A_motion]: {_mean('mean_motion_var'):.6f}")
+        print(f"Mean route-score std: {_mean('route_score_std'):.4f}")
+        print(f"Mean pairwise chunk distance: {_mean('pairwise_chunk_dist'):.4f}")
+        print(
+            f"Mean per-dim motion Var_x0: "
+            f"x={per_dim[0]:.6f} y={per_dim[1]:.6f} z={per_dim[2]:.6f} "
+            f"r0={per_dim[3]:.6f} r1={per_dim[4]:.6f} r2={per_dim[5]:.6f}"
+        )
+        print("Per-observation route-score spread:")
+        for r in diversity_records:
+            print(
+                f"  ep={r['episode']:03d} t={r['step']:03d} "
+                f"std={r['route_score_std']:.4f} "
+                f"q10={r['route_q10']:+.3f} "
+                f"q50={r['route_q50']:+.3f} "
+                f"q90={r['route_q90']:+.3f}"
+            )
+    else:
+        print(
+            "No diagnostic observation was collected; "
+            "no episode reached the first-lift condition."
+        )
 
 env.close()

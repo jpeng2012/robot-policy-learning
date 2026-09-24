@@ -12,7 +12,7 @@ from torchvision.models import resnet18, ResNet18_Weights
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
 from policies.common.observation_encoder_spatial import ObservationEncoder
-from policies.act.model_spatial import ACTPolicy
+from policies.flow_matching.model import FlowMatchingPolicy
 
 # ============================================================
 # Project imports
@@ -36,7 +36,7 @@ device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-checkpoint_path = "policies/act/act_1_4_3.pth"
+checkpoint_path = "policies/flow_matching/flowmatching_1_4_1.pth"
 
 num_episodes = 30
 max_steps = 700
@@ -189,13 +189,6 @@ action_horizon = int(
     )
 )
 
-latent_dim = int(
-    checkpoint.get(
-        "latent_dim",
-        32,
-    )
-)
-
 condition_dim = int(
     checkpoint.get(
         "condition_dim",
@@ -281,22 +274,18 @@ agent_feat_dim = 512 * vision_history_len
 wrist_feat_dim = 512 * vision_history_len
 proprio_feat_dim = proprio_dim * proprio_history_len
 
-policy = ACTPolicy(
+policy = FlowMatchingPolicy(
     observation_encoder=obs_encoder,
-    conditon_dim=condition_dim,
     agent_feat_dim=agent_feat_dim,
     wrist_feat_dim=wrist_feat_dim,
     proprio_feat_dim=proprio_feat_dim,
     action_dim=action_dim,
     action_horizon=action_horizon,
     hidden_dim=hidden_dim,
-    latent_dim=latent_dim,
-    num_encoder_layer=num_encoder_layer,
-    num_decoder_layer=num_decoder_layer,
+    num_layers=num_decoder_layer,
     num_heads=num_heads,
     dim_feedforward=dim_feedforward,
 ).to(device)
-
 
 policy.load_state_dict(
     checkpoint["policy_state_dict"]
@@ -309,7 +298,6 @@ print("Loaded:", checkpoint_path)
 print("device:", device)
 print("vision_history_len:", vision_history_len)
 print("proprio_history_len:", proprio_history_len)
-
 
 # ============================================================
 # Evaluation statistics
@@ -456,12 +444,13 @@ for episode in range(num_episodes):
 
         with torch.no_grad():
 
-            action_chunk, _, _ = policy(
-                    agent_tensor,
-                    wrist_tensor,
-                    proprio_tensor,
-                )
-            action_chunk = action_chunk.squeeze(0).cpu().numpy()
+            action_chunk = policy.sample_actions(
+                agent_tensor,
+                wrist_tensor,
+                proprio_tensor,
+                num_steps=10,
+            )
+            action_chunk = action_chunk[0].cpu().numpy()
             
 
         action_chunk[:, 6] = np.where(

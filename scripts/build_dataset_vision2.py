@@ -223,7 +223,7 @@ def build_samples(files):
 
             for k in range(action_horizon):
 
-                idx = t + k
+                idx = t + k + 1
 
                 # Pad end of trajectory by repeating
                 # final action.

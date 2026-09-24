@@ -36,10 +36,10 @@ device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-checkpoint_path = "policies/act/act_1_4_3.pth"
+checkpoint_path = "policies/act/act_1_4_ep015.pth"
 
-num_episodes = 30
-max_steps = 700
+num_episodes = 20
+max_steps = 500
 
 has_renderer = True
 
@@ -254,6 +254,30 @@ num_heads = int(
 
 execution_horizon = 4
 
+# ============================================================
+# ACT latent-diversity diagnostics
+#
+# Normal rollout is unchanged: policy(...) still uses z = 0.
+# Separately, at the first successful lift in each episode, we
+# decode the SAME observation using many fixed z ~ N(0, I).
+# ============================================================
+
+run_latent_diagnostics = True
+num_latent_samples = 50
+latent_diag_seed = 20260922
+route_action_dim = 0
+
+_latent_gen = torch.Generator(device=device)
+_latent_gen.manual_seed(latent_diag_seed)
+fixed_latents = torch.randn(
+    num_latent_samples,
+    latent_dim,
+    generator=_latent_gen,
+    device=device,
+)
+
+latent_diag_records = []
+
 agent_encoder = resnet18(
     weights=weights
 )
@@ -310,6 +334,79 @@ print("device:", device)
 print("vision_history_len:", vision_history_len)
 print("proprio_history_len:", proprio_history_len)
 
+# ============================================================
+# ACT latent-diversity diagnostic helpers
+# ============================================================
+
+@torch.no_grad()
+def sample_chunks_over_z(
+    policy, agent_tensor, wrist_tensor, proprio_tensor, latent_bank,
+):
+    """Fix observation o and vary only z. Returns (N, H, D)."""
+    (
+        _condition,
+        agent_feat,
+        wrist_feat,
+        proprio_feat,
+    ) = policy.observation_encoder(
+        agent_tensor, wrist_tensor, proprio_tensor, return_features=True,
+    )
+
+    n = latent_bank.shape[0]
+    agent_feat = agent_feat.expand(n, *agent_feat.shape[1:])
+    wrist_feat = wrist_feat.expand(n, *wrist_feat.shape[1:])
+    proprio_feat = proprio_feat.expand(n, *proprio_feat.shape[1:])
+
+    return policy.decoder(
+        agent_feat, wrist_feat, proprio_feat, latent_bank,
+    )
+
+
+@torch.no_grad()
+def compute_latent_diversity(
+    policy, agent_tensor, wrist_tensor, proprio_tensor, latent_bank, route_dim=0,
+):
+    """Compute Var_z A(o,z), route-score spread, and chunk diversity."""
+    chunks = sample_chunks_over_z(
+        policy, agent_tensor, wrist_tensor, proprio_tensor, latent_bank,
+    )
+    motion = chunks[..., :6]
+
+    action_var_hd = chunks.var(dim=0, unbiased=False)
+    motion_var_hd = motion.var(dim=0, unbiased=False)
+
+    route_score = motion[:, :, route_dim].sum(dim=1)
+    q_levels = torch.tensor(
+        [0.10, 0.25, 0.50, 0.75, 0.90],
+        device=route_score.device,
+        dtype=route_score.dtype,
+    )
+    q = torch.quantile(route_score, q_levels).cpu().numpy()
+
+    flat = motion.flatten(1)
+    pairwise = torch.cdist(flat, flat, p=2)
+    n = flat.shape[0]
+    upper = torch.triu(
+        torch.ones(n, n, dtype=torch.bool, device=flat.device), diagonal=1
+    )
+    pairwise_chunk_dist = pairwise[upper].mean().item() if n > 1 else 0.0
+
+    per_dim_var = motion_var_hd.mean(dim=0).cpu().numpy()
+
+    return {
+        "mean_action_var": action_var_hd.mean().item(),
+        "motion_action_var": motion_var_hd.mean().item(),
+        "route_score_mean": route_score.mean().item(),
+        "route_score_std": route_score.std(unbiased=False).item(),
+        "route_q10": float(q[0]),
+        "route_q25": float(q[1]),
+        "route_q50": float(q[2]),
+        "route_q75": float(q[3]),
+        "route_q90": float(q[4]),
+        "pairwise_chunk_dist": pairwise_chunk_dist,
+        "per_dim_var": per_dim_var,
+    }
+
 
 # ============================================================
 # Evaluation statistics
@@ -355,6 +452,7 @@ for episode in range(num_episodes):
 
     was_lifted = False
     ever_grasped = False
+    latent_diag_collected = False
 
     cube_x_history = []
 
@@ -585,6 +683,68 @@ for episode in range(num_episodes):
                 was_lifted = True
 
             # ====================================================
+            # ACT latent-diversity diagnostic
+            # ====================================================
+            if (
+                run_latent_diagnostics
+                and was_lifted
+                and not latent_diag_collected
+            ):
+                diag_agent_tensor = torch.stack(
+                    list(agent_history), dim=0
+                ).unsqueeze(0).to(device, non_blocking=True)
+
+                diag_wrist_tensor = torch.stack(
+                    list(wrist_history), dim=0
+                ).unsqueeze(0).to(device, non_blocking=True)
+
+                diag_proprio_tensor = torch.from_numpy(
+                    np.stack(list(proprio_history), axis=0)
+                ).unsqueeze(0).to(device, non_blocking=True)
+
+                diag = compute_latent_diversity(
+                    policy=policy,
+                    agent_tensor=diag_agent_tensor,
+                    wrist_tensor=diag_wrist_tensor,
+                    proprio_tensor=diag_proprio_tensor,
+                    latent_bank=fixed_latents,
+                    route_dim=route_action_dim,
+                )
+                diag["episode"] = episode
+                diag["step"] = t
+                latent_diag_records.append(diag)
+                latent_diag_collected = True
+
+                pdv = diag["per_dim_var"]
+                print(
+                    "\n[ACT latent diagnostic] "
+                    f"episode={episode} step={t} N_z={num_latent_samples}"
+                )
+                print(
+                    f"  mean_action_var={diag['mean_action_var']:.6f} "
+                    f"motion_var={diag['motion_action_var']:.6f}"
+                )
+                print(
+                    f"  route_score mean={diag['route_score_mean']:+.4f} "
+                    f"std={diag['route_score_std']:.4f}"
+                )
+                print(
+                    "  route_score quantiles "
+                    f"q10={diag['route_q10']:+.3f} "
+                    f"q25={diag['route_q25']:+.3f} "
+                    f"q50={diag['route_q50']:+.3f} "
+                    f"q75={diag['route_q75']:+.3f} "
+                    f"q90={diag['route_q90']:+.3f}"
+                )
+                print(
+                    f"  pairwise_chunk_dist={diag['pairwise_chunk_dist']:.4f}"
+                )
+                print(
+                    "  motion per-dim Var_z "
+                    f"x={pdv[0]:.6f} y={pdv[1]:.6f} z={pdv[2]:.6f} "
+                    f"r0={pdv[3]:.6f} r1={pdv[4]:.6f} r2={pdv[5]:.6f}"
+                )
+
             # Success geometry
             # ====================================================
 
@@ -810,6 +970,52 @@ if trajectory_lengths:
         f"  max="
         f"{np.max(trajectory_lengths)}"
     )
+
+# ============================================================
+# ACT latent-diversity summary
+# ============================================================
+if run_latent_diagnostics:
+    print("\n==============================")
+    print("ACT Latent-Diversity Diagnostics")
+    print("==============================")
+
+    if latent_diag_records:
+        def _diag_mean(key):
+            return float(np.mean([r[key] for r in latent_diag_records]))
+
+        print("Observations analyzed:", len(latent_diag_records))
+        print("Fixed latent samples / observation:", num_latent_samples)
+        print(f"Mean Var_z[A]: {_diag_mean('mean_action_var'):.6f}")
+        print(f"Mean motion Var_z[A]: {_diag_mean('motion_action_var'):.6f}")
+        print(f"Mean route-score std: {_diag_mean('route_score_std'):.4f}")
+        print(
+            f"Mean pairwise chunk distance: "
+            f"{_diag_mean('pairwise_chunk_dist'):.4f}"
+        )
+
+        per_dim = np.stack([
+            r["per_dim_var"] for r in latent_diag_records
+        ]).mean(axis=0)
+        print(
+            "Mean per-dim motion Var_z: "
+            f"x={per_dim[0]:.6f} y={per_dim[1]:.6f} z={per_dim[2]:.6f} "
+            f"r0={per_dim[3]:.6f} r1={per_dim[4]:.6f} r2={per_dim[5]:.6f}"
+        )
+
+        print("\nPer-observation route-score spread:")
+        for r in latent_diag_records:
+            print(
+                f"  ep={r['episode']:03d} t={r['step']:03d} "
+                f"std={r['route_score_std']:.4f} "
+                f"q10={r['route_q10']:+.3f} "
+                f"q50={r['route_q50']:+.3f} "
+                f"q90={r['route_q90']:+.3f}"
+            )
+    else:
+        print(
+            "No diagnostic observation was collected; "
+            "no episode reached the first-lift condition."
+        )
 
 
 env.close()
