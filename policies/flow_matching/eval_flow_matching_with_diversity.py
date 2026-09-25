@@ -27,7 +27,6 @@ if PROJECT_ROOT not in sys.path:
 
 from envs.constrained_pick_place import ConstrainedPickPlace
 
-
 # ============================================================
 # Config
 # ============================================================
@@ -42,7 +41,6 @@ num_episodes = 20
 max_steps = 500
 
 has_renderer = True
-
 
 # ============================================================
 # Target sampling

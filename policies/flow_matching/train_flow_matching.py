@@ -2,13 +2,13 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from policies.vision_bc.dataset import VisionChunkBCDataset
 from torchvision.models import (
     resnet18,
     ResNet18_Weights,
 )
-import torch.nn.functional as F
 
 from policies.common.observation_encoder_spatial import ObservationEncoder
 from policies.flow_matching.model import FlowMatchingPolicy
@@ -32,7 +32,6 @@ action_dim = 7
 
 condition_dim = 256
 hidden_dim = 512
-
 
 num_encoder_layer=4
 num_decoder_layer=4
@@ -65,15 +64,21 @@ STATE_TO_ID = {
     "RELEASE": 6,
 }
 
-STATE_WEIGHT = torch.tensor([
-    1.0,   # APPROACH
-    1.0,   # DESCEND
-    1.0,   # GRASP
-    1.0,   # LIFT
-    0.5,   # TRANSPORT
-    1.0,   # LOWER
-    2.0,   # RELEASE
-], dtype=torch.float32, device=device)
+STATE_WEIGHT = torch.tensor(
+    [
+        1.0,   # APPROACH
+        1.0,   # DESCEND
+        1.0,   # GRASP
+        1.0,   # LIFT
+        0.5,   # TRANSPORT
+        1.0,   # LOWER
+        2.0,   # RELEASE
+    ], dtype=torch.float32, device=device,
+)
+
+# ============================================================
+# Dataset
+# ============================================================
 
 weights = ResNet18_Weights.DEFAULT
 transform = weights.transforms()
@@ -106,7 +111,7 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=8,
+    num_workers=num_workers,
     pin_memory=True,
     persistent_workers=True,
 )
@@ -115,10 +120,14 @@ val_loader = DataLoader(
     val_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=8,
+    num_workers=num_workers,
     pin_memory=True,
     persistent_workers=True,
 )
+
+# ============================================================
+# Model
+# ============================================================
 
 agent_encoder = resnet18(weights=weights)
 
@@ -154,7 +163,6 @@ obs_encoder = ObservationEncoder(
     condition_dim=condition_dim,
 ).to(device)
 
-
 policy = FlowMatchingPolicy(
     observation_encoder=obs_encoder,
     agent_feat_dim=agent_feat_dim,
@@ -169,24 +177,26 @@ policy = FlowMatchingPolicy(
 ).to(device)
 
 # fine-tune the ResNets, but with a lower LR on the encoders than on the MLP head:
-optimizer = torch.optim.AdamW([
-    {
-        "params": obs_encoder.agent_encoder.layer4.parameters(),
-        "lr": encoder_lr,
-    },
-    {
-        "params": obs_encoder.wrist_encoder.layer4.parameters(),
-        "lr": encoder_lr,
-    },
-    {
-        "params": obs_encoder.projector.parameters(),
-        "lr": projector_lr,
-    },
-    {
-        "params": policy.flow_decoder.parameters(),
-        "lr": decoder_lr,
-    }
-])
+optimizer = torch.optim.AdamW(
+    [
+        {
+            "params": obs_encoder.agent_encoder.layer4.parameters(),
+            "lr": encoder_lr,
+        },
+        {
+            "params": obs_encoder.wrist_encoder.layer4.parameters(),
+            "lr": encoder_lr,
+        },
+        {
+            "params": obs_encoder.projector.parameters(),
+            "lr": projector_lr,
+        },
+        {
+            "params": policy.flow_decoder.parameters(),
+            "lr": decoder_lr,
+        },
+    ]
+)
 
 best_eval_loss = float('inf')
 
@@ -194,6 +204,8 @@ best_eval_loss = float('inf')
 for epoch in range(num_epochs):
 
     torch.cuda.reset_peak_memory_stats()
+
+    t0 = time.time()
 
     policy.train()
 
@@ -206,8 +218,6 @@ for epoch in range(num_epochs):
     # obs_encoder.wrist_encoder.layer4.train()
 
     train_loss = 0.0
-
-    t0 = time.time()
 
     for batch_idx, batch in enumerate(train_loader):
         batch_start = time.time()
@@ -330,7 +340,8 @@ for epoch in range(num_epochs):
                 f"x={x_loss.item():.5f} "
                 f"y={y_loss.item():.5f} "
                 f"z={z_loss.item():.5f} "
-                f"batch_time={time.time()-batch_start:.2f}s")
+                f"batch_time={time.time()-batch_start:.2f}s"
+            )
 
     train_loss /= len(train_dataset)
 
@@ -447,12 +458,12 @@ for epoch in range(num_epochs):
 
     print(
         torch.cuda.max_memory_allocated() / 1024**3,
-        "GB allocated"
+        "GB allocated",
     )
 
     print(
         torch.cuda.max_memory_reserved() / 1024**3,
-        "GB reserved"
+        "GB reserved",
     )
 
     # if val_loss < best_eval_loss:
