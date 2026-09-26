@@ -5,143 +5,34 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-from torchvision.models import ViT_B_16_Weights
+# from torchvision.models import ViT_B_16_Weights
 from tqdm import tqdm
+import wandb
 
-from world_models.data import WorldModelWindowDataset
+from world_models.data import WorldModelFeatureWindowDataset
 from world_models.models import LatentWorldModel
 
 
-def move_batch_to_device(
-    batch,
-    device,
-):
-    """
-    Move the tensors used by the world model to GPU / CPU.
-
-    The dataset returns history dimensions:
-
-        agent_images:
-            [B, history_len, 3, H, W]
-
-    For the first WM experiment we use history_len=1,
-    so we remove that dimension before encoding.
-    """
-
-    agent_images = batch[
-        "agent_images"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    wrist_images = batch[
-        "wrist_images"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    task_state = batch[
-        "task_state"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    robot_config = batch[
-        "robot_config"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    actions = batch[
-        "actions"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    future_agent_images = batch[
-        "future_agent_images"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    future_wrist_images = batch[
-        "future_wrist_images"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    future_task_state = batch[
-        "future_task_state"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    future_robot_config = batch[
-        "future_robot_config"
-    ].to(
-        device,
-        non_blocking=True,
-    )
-
-    # --------------------------------------------------------
-    # history_len = 1
-    #
-    # [B, 1, ...]
-    #
-    # ->
-    #
-    # [B, ...]
-    # --------------------------------------------------------
-
-    if agent_images.shape[1] != 1:
-        raise ValueError(
-            "Current training script expects "
-            "history_len=1"
-        )
-
-    agent_images = agent_images[:, 0]
-
-    wrist_images = wrist_images[:, 0]
-
-    task_state = task_state[:, 0]
-
-    robot_config = robot_config[:, 0]
+def move_batch_to_device(batch, device):
+    keys = [
+        "agent_features",
+        "wrist_features",
+        "task_state",
+        "robot_config",
+        "actions",
+        "future_agent_features",
+        "future_wrist_features",
+        "future_task_state",
+        "future_robot_config",
+    ]
 
     return {
-        "agent_images":
-            agent_images,
-
-        "wrist_images":
-            wrist_images,
-
-        "task_state":
-            task_state,
-
-        "robot_config":
-            robot_config,
-
-        "actions":
-            actions,
-
-        "future_agent_images":
-            future_agent_images,
-
-        "future_wrist_images":
-            future_wrist_images,
-
-        "future_task_state":
-            future_task_state,
-
-        "future_robot_config":
-            future_robot_config,
+        key:
+            batch[key].to(
+                device,
+                non_blocking=True,
+            )
+        for key in keys
     }
 
 
@@ -202,7 +93,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        output = model(**batch)
+        output = model.forward_features(**batch)
 
         losses = model.compute_latent_loss(output["predicted_future"], output["target_future"])
 
@@ -260,7 +151,7 @@ def validate(
     for batch in pbar:
         batch = move_batch_to_device(batch, device)
 
-        output = model(**batch)
+        output = model.forward_features(**batch)
 
         losses = model.compute_latent_loss(output["predicted_future"], output["target_future"])
         horizon_losses = compute_horizon_losses(output["predicted_future"], output["target_future"])
@@ -298,7 +189,7 @@ def main():
     parser.add_argument(
         "--data-root",
         type=str,
-        default="data/level3",
+        default="data/level3_wm_features",
     )
 
     parser.add_argument(
@@ -337,6 +228,23 @@ def main():
         default="checkpoints/world_model",
     )
 
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="robot-world-model",
+    )
+
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+    )
+
     args = parser.parse_args()
 
     device = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
@@ -347,54 +255,47 @@ def main():
     # Find trajectories
     # ========================================================
 
-    files = sorted(Path(args.data_root).glob("*.pkl"))
+    trajectory_dirs = sorted(
+        [ path for path in Path(args.data_root).iterdir() if path.is_dir() ]
+    )
 
-    if len(files) < 2:
+    if len(trajectory_dirs) < 2:
         raise RuntimeError(
-            "Need at least two trajectories"
+            "Need at least two feature trajectories"
         )
 
     # ========================================================
     # Episode-level train / validation split
     # ========================================================
 
-    split = int(0.9*len(files))
+    split = int(0.9*len(trajectory_dirs))
 
-    train_files = files[:split]
+    train_dirs = trajectory_dirs[:split]
 
-    val_files = files[split:]
+    val_dirs = trajectory_dirs[split:]
 
     print(
         "train trajectories:",
-        len(train_files),
+        len(train_dirs),
     )
 
     print(
         "val trajectories:",
-        len(val_files),
+        len(val_dirs),
     )
-
-    # ========================================================
-    # ViT image transform
-    # ========================================================
-    transform = ViT_B_16_Weights.DEFAULT.transforms()
 
     # ========================================================
     # Datasets
     # ========================================================
 
-    train_dataset = WorldModelWindowDataset(
-            trajectory_files=train_files,
-            history_len=1,
+    train_dataset = WorldModelFeatureWindowDataset(
+            trajectory_dirs=train_dirs,
             horizon=args.horizon,
-            image_transform=transform,
     )
 
-    val_dataset = WorldModelWindowDataset(
-            trajectory_files=val_files,
-            history_len=1,
+    val_dataset = WorldModelFeatureWindowDataset(
+            trajectory_dirs=val_dirs,
             horizon=args.horizon,
-            image_transform=transform,
     )
 
     print(
@@ -465,6 +366,67 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_loss = float("inf")
+
+    run = None
+    
+    if not args.no_wandb:
+
+        run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            config={
+                "batch_size":
+                    args.batch_size,
+
+                "epochs":
+                    args.epochs,
+
+                "learning_rate":
+                    args.lr,
+
+                "horizon":
+                    args.horizon,
+
+                "latent_dim":
+                    384,
+
+                "latent_grid_size":
+                    4,
+
+                "num_state_tokens":
+                    34,
+
+                "dynamics_layers":
+                    6,
+
+                "dynamics_heads":
+                    6,
+
+                "dynamics_ff_dim":
+                    1536,
+
+                "ema_momentum":
+                    0.996,
+
+                "freeze_vision":
+                    True,
+
+                "feature_cache":
+                    True,
+
+                "train_trajectories":
+                    len(train_dirs),
+
+                "val_trajectories":
+                    len(val_dirs),
+
+                "train_windows":
+                    len(train_dataset),
+
+                "val_windows":
+                    len(val_dataset),
+            },
+        )
 
     # ========================================================
     # Training

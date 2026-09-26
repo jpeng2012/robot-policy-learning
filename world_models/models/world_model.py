@@ -198,6 +198,30 @@ class LatentWorldModel(nn.Module):
              robot_config=robot_config,
         )
 
+
+    def encode_current_features(
+        self,
+        agent_features: torch.Tensor,
+        wrist_features: torch.Tensor,
+        task_state: torch.Tensor,
+        robot_config: torch.Tensor,
+    ):
+        """
+        Encode current observation from cached ViT features.
+
+        Output:
+
+            [B, N, D]
+        """
+
+        return self.online_encoder.forward_features(
+            agent_features=agent_features,
+            wrist_features=wrist_features,
+            task_state=task_state,
+            robot_config=robot_config,
+        )
+    
+
     @torch.no_grad()
     def encode_future_targets(
         self,
@@ -242,6 +266,72 @@ class LatentWorldModel(nn.Module):
             task_state=task_state,
             robot_config=robot_config,
         )
+
+        target = target.reshape(
+            B,
+            H,
+            self.num_state_tokens,
+            self.latent_dim,
+        )
+
+        return target
+
+    @torch.no_grad()
+    def encode_future_feature_targets(
+        self,
+        future_agent_features: torch.Tensor,
+        future_wrist_features: torch.Tensor,
+        future_task_state: torch.Tensor,
+        future_robot_config: torch.Tensor,
+    ):
+        """
+        Encode cached future ViT features using the EMA target encoder.
+
+        Inputs:
+
+            future_agent_features:
+                [B, H, 16, 768]
+
+            future_wrist_features:
+                [B, H, 16, 768]
+
+            future_task_state:
+                [B, H, 9]
+
+            future_robot_config:
+                [B, H, 7]
+
+        Output:
+
+            [B, H, N, D]
+        """
+
+        B, H = future_agent_features.shape[:2]
+            
+
+        # ========================================================
+        # Flatten batch and future time
+        # ========================================================
+
+        agent = future_agent_features.flatten(0, 1)
+        wrist = future_wrist_features.flatten(0, 1)
+        task_state = future_task_state.flatten(0, 1)
+        robot_config = future_robot_config.flatten(0, 1)
+
+        # ========================================================
+        # EMA target encoder
+        # ========================================================
+
+        target = self.target_encoder.forward_features(
+                agent_features=agent,
+                wrist_features=wrist,
+                task_state=task_state,
+                robot_config=robot_config,
+        )
+
+        # ========================================================
+        # Restore future dimension
+        # ========================================================
 
         target = target.reshape(
             B,
@@ -311,6 +401,65 @@ class LatentWorldModel(nn.Module):
             future_wrist_images=future_wrist_images,
             future_task_state=future_task_state,
             future_robot_config=future_robot_config,
+        )
+
+        return {
+            "current_latent":
+                current_latent,
+
+            "predicted_future":
+                predicted_future,
+
+            "target_future":
+                target_future,
+        }
+
+
+    def forward_features(
+        self,
+        agent_features: torch.Tensor,
+        wrist_features: torch.Tensor,
+        task_state: torch.Tensor,
+        robot_config: torch.Tensor,
+        actions: torch.Tensor,
+        future_agent_features: torch.Tensor,
+        future_wrist_features: torch.Tensor,
+        future_task_state: torch.Tensor,
+        future_robot_config: torch.Tensor,
+    ):
+        """
+        Full world-model forward pass using cached ViT features.
+        """
+
+        # ========================================================
+        # Current state
+        # ========================================================
+
+        current_latent = self.encode_current_features(
+                agent_features=agent_features,
+                wrist_features=wrist_features,
+                task_state=task_state,
+                robot_config=robot_config,
+        )
+
+        # ========================================================
+        # Predict future
+        # ========================================================
+
+        predicted_future = self.predict_future(
+            current_latent=current_latent,
+            actions=actions,
+        )
+
+        # ========================================================
+        # EMA targets
+        # ========================================================
+
+        target_future = self.encode_future_feature_targets(
+                future_agent_features=future_agent_features,
+                future_wrist_features=future_wrist_features,
+                future_task_state=future_task_state,
+                future_robot_config=future_robot_config,
         )
 
         return {

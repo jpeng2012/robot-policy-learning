@@ -129,6 +129,30 @@ class SpatialViTEncoder(nn.Module):
 
         return patch_tokens
 
+    
+    def project_features(
+                self,
+                features: torch.Tensor,
+        ):
+            """
+            Project precomputed frozen ViT features.
+    
+            Input:
+    
+                [B, 16, 768]
+    
+            Output:
+    
+                [B, 16, latent_dim]
+            """
+    
+            x = self.projection(features)
+    
+            x = self.output_norm(x)
+    
+            return x
+    
+    
     def forward(
             self, 
             images: torch.Tensor,
@@ -193,7 +217,6 @@ class SpatialViTEncoder(nn.Module):
         # Project 768 -> latent_dim
         # ====================================================
 
-        x = self.projection(x)
-        x = self.output_norm(x)
+        return self.project_features(x)
 
-        return x
+    

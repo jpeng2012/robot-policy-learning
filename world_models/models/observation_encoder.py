@@ -168,4 +168,65 @@ class ObservationEncoder(nn.Module):
 
 
 
+    def forward_features(
+            self,
+            agent_features: torch.Tensor,
+            wrist_features: torch.Tensor,
+            task_state: torch.Tensor,
+            robot_config: torch.Tensor,
+        ):
+            
+            """
+            Encode precomputed frozen ViT features.
+    
+            Inputs:
+    
+                agent_features:
+                    [B, 16, 768]
+    
+                wrist_features:
+                    [B, 16, 768]
+    
+                task_state:
+                    [B, 9]
+    
+                robot_config:
+                    [B, 7]
+    
+            Output:
+    
+                tokens:
+                    [B, 34, latent_dim]
+            """
+            agent_token = self.visual_encoder.project_features(agent_features)
+            wrist_token = self.visual_encoder.project_features(wrist_features)
+            # [B, 16, 384]
+
+            task_token = self.task_state_projection(task_state).unsqueeze(dim=1)
+            config_token = self.robot_config_projection(robot_config).unsqueeze(dim=1)
+    
+            # ====================================================
+            # Add token-type information
+            # ====================================================
+            agent_type = self.token_type_embedding.weight[0]
+            wrist_type = self.token_type_embedding.weight[1]
+            task_type = self.token_type_embedding.weight[2]
+            config_type = self.token_type_embedding.weight[3]
+    
+            agent_token = agent_token + agent_type
+            wrist_token = wrist_token + wrist_type
+            task_token = task_token + task_type
+            config_token = config_token + config_type
+    
+            tokens = torch.cat(
+                [
+                    agent_token,
+                    wrist_token,
+                    task_token,
+                    config_token,
+                ], 
+                dim=1,
+            )
+    
+            return tokens
 
