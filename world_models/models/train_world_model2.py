@@ -4,13 +4,65 @@ import argparse
 from pathlib import Path
 
 import torch
+import yaml
 from torch.utils.data import DataLoader
-# from torchvision.models import ViT_B_16_Weights
 from tqdm import tqdm
 import wandb
+import time
 
 from world_models.data import WorldModelFeatureWindowDataset
 from world_models.models import LatentWorldModel
+
+
+DEFAULT_CONFIG = {
+    # Data
+    "data_root": "data/level3_wm_features",
+    "train_val_split": 0.9,
+
+    # Training
+    "batch_size": 32,
+    "epochs": 20,
+    "lr": 3e-4,
+    "weight_decay": 1e-4,
+    "grad_clip_norm": 1.0,
+    "num_workers": 4,
+
+    # Model
+    "latent_dim": 384,
+    "latent_grid_size": 4,
+    "task_state_dim": 9,
+    "robot_config_dim": 7,
+    "action_dim": 7,
+    "horizon": 16,
+    "num_dynamics_layers": 6,
+    "num_dynamics_heads": 6,
+    "dynamics_ff_dim": 1536,
+    "dropout": 0.1,
+    "ema_momentum": 0.996,
+    "freeze_vision": True,
+
+    # Output
+    "output_dir": "checkpoints/world_model",
+
+    # Wandb
+    "wandb_project": "robot-world-model",
+    "wandb_name": None,
+    "no_wandb": False,
+}
+
+
+def load_config(config_path: str | None) -> dict:
+    """Load config from YAML file, with defaults for missing values."""
+    config = DEFAULT_CONFIG.copy()
+
+    if config_path is not None:
+        with open(config_path) as f:
+            user_config = yaml.safe_load(f)
+
+        if user_config:
+            config.update(user_config)
+
+    return config
 
 
 def move_batch_to_device(batch, device):
@@ -55,23 +107,21 @@ def compute_horizon_losses(
 
     results = {}
 
-    horzions = [1, 2, 4, 8, 16]
+    horizons = [1, 2, 4, 8, 16]
 
-    for horzion in horzions:
-        if horzion > model.horzion:
+    for horizon in horizons:
+        if horizon > model.horizon:
             continue
 
-        index = horzion + 1
+        index = horizon - 1
 
         pred = predicated_future[:, index:index+1]
 
-        target = target_future[:, index, index+1]
+        target = target_future[:, index:index+1]
 
         losses = model.compute_latent_loss(pred, target)
 
-        results[
-            horzion
-        ] = losses["loss"]
+        results[horizon] = losses["loss"]
 
     return results
 
@@ -81,10 +131,17 @@ def train_one_epoch(
         loader,
         optimizer,
         device,
+        grad_clip_norm: float = 1.0,
 ):
     model.train()
 
-    total_loss = 0.0
+    totals = {
+        "loss": 0.0,
+        "agent_loss": 0.0,
+        "wrist_loss": 0.0,
+        "task_loss": 0.0,
+        "config_loss": 0.0,
+    }
     num_batches = 0
 
     pbar = tqdm(loader, desc="Training", leave=False)
@@ -103,7 +160,7 @@ def train_one_epoch(
 
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
-            max_norm=1.0,
+            max_norm=grad_clip_norm,
         )
 
         optimizer.step()
@@ -114,13 +171,21 @@ def train_one_epoch(
 
         model.update_target_encoder()
 
-        total_loss += loss.item()
+        for key in totals:
+            totals[key] += losses[key].item()
 
         num_batches += 1
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        running_loss = totals["loss"] / num_batches
+        
+        pbar.set_postfix(
+            batch=f"{loss.item():.4f}",
+            avg=f"{running_loss:.4f}",
+        )
 
-    return total_loss / max(num_batches, 1)
+    return {
+        key: value / max(num_batches, 1) for key, value in totals.items() 
+    }
 
 
 @torch.no_grad()
@@ -131,7 +196,13 @@ def validate(
 ):
     model.eval()
 
-    total_loss = 0.0
+    totals = {
+        "loss": 0.0,
+        "agent_loss": 0.0,
+        "wrist_loss": 0.0,
+        "task_loss": 0.0,
+        "config_loss": 0.0,
+    }
     num_batches = 0
 
     horizon_totals = {
@@ -154,31 +225,34 @@ def validate(
         output = model.forward_features(**batch)
 
         losses = model.compute_latent_loss(output["predicted_future"], output["target_future"])
-        horizon_losses = compute_horizon_losses(output["predicted_future"], output["target_future"])
+        horizon_losses = compute_horizon_losses(model, output["predicted_future"], output["target_future"])
 
-        total_loss += losses['loss'].item()
+        for key in totals:
+            totals[key] += losses[key].item()
 
         num_batches += 1
 
-        pbar.set_postfix(loss=f"{losses['loss'].item():.4f}")
+        running_loss = totals["loss"] / num_batches
+
+        pbar.set_postfix(
+            batch=f"{losses['loss'].item():.4f}",
+            avg=f"{running_loss:.4f}",
+        )
 
         for horizon, loss in horizon_losses.items():
             horizon_totals[horizon] += loss.item()
             horizon_counts[horizon] += 1
-
-
     
-    
-    mean_loss = total_loss / max(num_batches, 1)
+    mean_loss = {
+        key: value / max(num_batches, 1) for key, value in totals.items() 
+    }
 
     mean_horizon_losses = {}
 
     for horizon in horizon_totals:
-
         if horizon_counts[horizon]> 0:
             mean_horizon_losses[horizon] = horizon_totals[horizon] / horizon_counts[horizon]
     
-
     return mean_loss, mean_horizon_losses
 
 
@@ -187,57 +261,10 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--data-root",
-        type=str,
-        default="data/level3_wm_features",
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=8,
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=20,
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=3e-4,
-    )
-
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
-        "--horizon",
-        type=int,
-        default=16,
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="checkpoints/world_model",
-    )
-
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default="robot-world-model",
-    )
-
-    parser.add_argument(
-        "--wandb-name",
+        "--config",
         type=str,
         default=None,
+        help="Path to YAML config file",
     )
 
     parser.add_argument(
@@ -247,16 +274,22 @@ def main():
 
     args = parser.parse_args()
 
-    device = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
+    config = load_config(args.config)
 
-    print( "device: ", device)
+    if args.no_wandb:
+        config["no_wandb"] = True
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("device:", device)
+    print("config:", config)
 
     # ========================================================
     # Find trajectories
     # ========================================================
 
     trajectory_dirs = sorted(
-        [ path for path in Path(args.data_root).iterdir() if path.is_dir() ]
+        [path for path in Path(config["data_root"]).iterdir() if path.is_dir()]
     )
 
     if len(trajectory_dirs) < 2:
@@ -268,7 +301,7 @@ def main():
     # Episode-level train / validation split
     # ========================================================
 
-    split = int(0.9*len(trajectory_dirs))
+    split = int(config["train_val_split"] * len(trajectory_dirs))
 
     train_dirs = trajectory_dirs[:split]
 
@@ -290,12 +323,12 @@ def main():
 
     train_dataset = WorldModelFeatureWindowDataset(
             trajectory_dirs=train_dirs,
-            horizon=args.horizon,
+            horizon=config["horizon"],
     )
 
     val_dataset = WorldModelFeatureWindowDataset(
             trajectory_dirs=val_dirs,
-            horizon=args.horizon,
+            horizon=config["horizon"],
     )
 
     print(
@@ -313,18 +346,18 @@ def main():
     # ========================================================
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=config["batch_size"],
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=config["num_workers"],
         pin_memory=True,
         drop_last=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=config["batch_size"],
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=config["num_workers"],
         pin_memory=True,
     )
 
@@ -333,18 +366,18 @@ def main():
     # ========================================================
 
     model = LatentWorldModel(
-        latent_dim=384,
-        latent_grid_size=4,
-        task_state_dim=9,
-        robot_config_dim=7,
-        action_dim=7,
-         horizon=args.horizon,
-        num_dynamics_layers=6,
-        num_dynamics_heads=6,
-        dynamics_ff_dim=1536,
-        dropout=0.1,
-        ema_momentum=0.996,
-        freeze_vision=True,
+        latent_dim=config["latent_dim"],
+        latent_grid_size=config["latent_grid_size"],
+        task_state_dim=config["task_state_dim"],
+        robot_config_dim=config["robot_config_dim"],
+        action_dim=config["action_dim"],
+        horizon=config["horizon"],
+        num_dynamics_layers=config["num_dynamics_layers"],
+        num_dynamics_heads=config["num_dynamics_heads"],
+        dynamics_ff_dim=config["dynamics_ff_dim"],
+        dropout=config["dropout"],
+        ema_momentum=config["ema_momentum"],
+        freeze_vision=config["freeze_vision"],
     ).to(device)
 
     # ========================================================
@@ -354,94 +387,52 @@ def main():
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]
 
     optimizer = torch.optim.AdamW(
-        trainable_parameters, lr=args.lr, weight_decay=1e-4
+        trainable_parameters,
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
     )
 
     # ========================================================
     # Output directory
     # ========================================================
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(config["output_dir"])
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_loss = float("inf")
 
     run = None
-    
-    if not args.no_wandb:
+
+    if not config["no_wandb"]:
+        wandb_config = config.copy()
+        wandb_config["train_trajectories"] = len(train_dirs)
+        wandb_config["val_trajectories"] = len(val_dirs)
+        wandb_config["train_windows"] = len(train_dataset)
+        wandb_config["val_windows"] = len(val_dataset)
 
         run = wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_name,
-            config={
-                "batch_size":
-                    args.batch_size,
-
-                "epochs":
-                    args.epochs,
-
-                "learning_rate":
-                    args.lr,
-
-                "horizon":
-                    args.horizon,
-
-                "latent_dim":
-                    384,
-
-                "latent_grid_size":
-                    4,
-
-                "num_state_tokens":
-                    34,
-
-                "dynamics_layers":
-                    6,
-
-                "dynamics_heads":
-                    6,
-
-                "dynamics_ff_dim":
-                    1536,
-
-                "ema_momentum":
-                    0.996,
-
-                "freeze_vision":
-                    True,
-
-                "feature_cache":
-                    True,
-
-                "train_trajectories":
-                    len(train_dirs),
-
-                "val_trajectories":
-                    len(val_dirs),
-
-                "train_windows":
-                    len(train_dataset),
-
-                "val_windows":
-                    len(val_dataset),
-            },
+            project=config["wandb_project"],
+            name=config["wandb_name"],
+            config=wandb_config,
         )
 
     # ========================================================
     # Training
     # ========================================================
 
-    for epoch in range(args.epochs):
-        train_loss = train_one_epoch(
+    for epoch in range(config["epochs"]):
+        epoch_start = time.time()
+        train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
+            grad_clip_norm=config["grad_clip_norm"],
         )
 
         (
-            val_loss,
+            val_metrics,
             horizon_losses,
         ) = validate(
             model=model,
@@ -449,17 +440,19 @@ def main():
             device=device,
         )
 
+        epoch_seconds = time.time() - epoch_start
+
         print()
         print(f"epoch {epoch:03d}")
 
         print(
             f"  train loss: "
-            f"{train_loss:.6f}"
+            f"{train_metrics['loss']:.6f}"
         )
 
         print(
             f"  val loss:   "
-            f"{val_loss:.6f}"
+            f"{val_metrics['loss']:.6f}"
         )
 
         for horizon in sorted(
@@ -469,6 +462,51 @@ def main():
                 f"  horizon {horizon:2d}: "
                 f"{horizon_losses[horizon]:.6f}"
             )
+
+        if run is not None:
+
+            metrics = {
+                "epoch":
+                    epoch,
+
+                "train/loss":
+                    train_metrics["loss"],
+
+                "train/agent":
+                    train_metrics["agent_loss"],
+
+                "train/wrist":
+                    train_metrics["wrist_loss"],
+
+                "train/task_state":
+                    train_metrics["task_loss"],
+
+                "train/robot_config":
+                    train_metrics["config_loss"],
+
+                "val/loss":
+                    val_metrics["loss"],
+
+                "val/agent":
+                    val_metrics["agent_loss"],
+
+                "val/wrist":
+                    val_metrics["wrist_loss"],
+
+                "val/task_state":
+                    val_metrics["task_loss"],
+
+                "val/robot_config":
+                    val_metrics["config_loss"],
+
+                "system/epoch_seconds":
+                    epoch_seconds,
+            }
+
+            for horizon, loss in horizon_losses.items():
+                metrics[f"val/horizon_{horizon}"] = loss
+
+            run.log(metrics, step=epoch,)
 
         # ====================================================
         # Save current checkpoint
@@ -485,16 +523,16 @@ def main():
                 optimizer.state_dict(),
 
             "train_loss":
-                train_loss,
+                train_metrics["loss"],
 
             "val_loss":
-                val_loss,
+                val_metrics["loss"],
 
             "horizon_losses":
                 horizon_losses,
 
             "horizon":
-                args.horizon,
+                config["horizon"],
 
             "latent_dim":
                 model.latent_dim,
@@ -513,9 +551,9 @@ def main():
         # Save best validation checkpoint
         # ====================================================
 
-        if val_loss < best_val_loss:
+        if val_metrics["loss"] < best_val_loss:
 
-            best_val_loss = val_loss
+            best_val_loss = val_metrics["loss"]
 
             torch.save(
                 checkpoint,
@@ -527,6 +565,8 @@ def main():
                 "  saved new best checkpoint"
             )
 
+    if run is not None:
+        run.finish()
 
 if __name__ == "__main__":
     main()

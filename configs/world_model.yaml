@@ -1,0 +1,49 @@
+# World Model Training Configuration
+
+# =============================================================================
+# Data
+# =============================================================================
+data_root: data/level3_wm_features
+train_val_split: 0.9
+
+# =============================================================================
+# Training
+# =============================================================================
+batch_size: 32
+epochs: 20
+lr: 3.0e-4
+weight_decay: 1.0e-4
+grad_clip_norm: 1.0
+num_workers: 4
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+latent_dim: 384
+latent_grid_size: 4
+task_state_dim: 9
+robot_config_dim: 7
+action_dim: 7
+horizon: 16
+
+# Dynamics Transformer
+num_dynamics_layers: 6
+num_dynamics_heads: 6
+dynamics_ff_dim: 1536
+dropout: 0.1
+
+# JEPA
+ema_momentum: 0.996
+freeze_vision: true
+
+# =============================================================================
+# Output
+# =============================================================================
+output_dir: checkpoints/world_model
+
+# =============================================================================
+# Logging
+# =============================================================================
+wandb_project: robot-world-model
+wandb_name: null
+no_wandb: false

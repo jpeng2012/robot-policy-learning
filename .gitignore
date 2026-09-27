@@ -16,6 +16,7 @@ venv/
 .venv/
 env/
 logs/
+wandb/
 
 # IDE
 .vscode/

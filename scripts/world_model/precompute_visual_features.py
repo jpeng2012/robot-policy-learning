@@ -48,11 +48,13 @@ def extract_pooled_features(
     # in RAM.
     # --------------------------------------------------------
 
+    grid_tokens = encoder.latent_grid_size * encoder.latent_grid_size
+
     output = np.lib.format.open_memmap(
         output_path,
         mode="w+",
         dtype=np.float16,
-        shape=(num_images, 16, encoder.vit_dim),
+        shape=(num_images, grid_tokens, encoder.vit_dim),
     )
 
     for start in range(0, num_images, batch_size):
@@ -61,11 +63,10 @@ def extract_pooled_features(
         images = []
 
         for path in image_paths[start:end]:
-            image = Image.open(path).convert('RGB')
-
-            image = transform(image)
-
-            images.append(image)
+            with Image.open(path) as image:
+                image = image.convert('RGB')
+                image = transform(image)
+                images.append(image)
 
         images = torch.stack(
             images, dim=0
@@ -87,13 +88,18 @@ def extract_pooled_features(
 
         grid_size = int(N ** 0.5)
 
+        if grid_size * grid_size != N:
+            raise ValueError(
+                f"Expected square patch grid, got N={N}"
+            )
+
         features = patch_tokens.reshape(B, grid_size, grid_size, D)
 
         features = features.permute(0, 3, 1, 2)
 
         features = F.adaptive_avg_pool2d(
             features,
-            output_size=(4, 4),
+            output_size=(encoder.latent_grid_size, encoder.latent_grid_size),
         )
 
         features = features.flatten(2).transpose(1, 2)
@@ -104,6 +110,8 @@ def extract_pooled_features(
             f"    {end:5d} / "
             f"{num_images:5d}"
         )
+
+        output.flush()
 
 def process_trajectory(
         trajectory_file,
@@ -125,12 +133,18 @@ def process_trajectory(
 
     trajectory_dir = (output_root / trajectory_file.stem)
 
+    meta_file = trajectory_dir / "metadata.json"
+
+    if meta_file.exists():
+        print("  features already exist, skipping")
+        return
+
     trajectory_dir.mkdir(
         parents=True,
         exist_ok=True
     )
     
-        # ========================================================
+    # ========================================================
     # Agent camera
     # ========================================================
 
@@ -210,19 +224,11 @@ def process_trajectory(
             encoder.vit_dim,
 
         "visual_tokens":
-            16,
+            encoder.latent_grid_size * encoder.latent_grid_size,
     }
 
-    with (
-        trajectory_dir
-        / "metadata.json"
-    ).open("w") as f:
-
-        json.dump(
-            metadata,
-            f,
-            indent=2,
-        )
+    with (trajectory_dir / "metadata.json").open("w") as f:
+        json.dump(metadata, f, indent=2)
 
 def main():
 
