@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .observation_encoder import ObservationEncoder
+from .observation_encoder import ObservationEncoder, ObservationEncoderVjepa
 from .dynamics_transformer import DynamicsTransformer
 
 
@@ -92,12 +92,12 @@ class LatentWorldModel(nn.Module):
         self.num_state_tokens = 2 * self.num_visual_tokens_per_camera + 2
 
         self.online_encoder = ObservationEncoder(
-               latent_dim=latent_dim,
-               latent_grid_size=latent_grid_size,
-               task_state_dim=task_state_dim,
-               robot_config_dim=robot_config_dim,
-               pretrained_vision=True,
-               freeze_vision=freeze_vision,
+                latent_dim=latent_dim,
+                latent_grid_size=latent_grid_size,
+                task_state_dim=task_state_dim,
+                robot_config_dim=robot_config_dim,
+                pretrained_vision=True,
+                freeze_vision=freeze_vision,
         )
 
         # ====================================================
@@ -601,4 +601,420 @@ class LatentWorldModel(nn.Module):
         }
 
 
+class LatentWorldModelVjepa(nn.Module):
+    """
+    JEPA-style action-conditioned latent world model.
+
+    Main flow:
+
+        current observation
+            |
+            v
+        online encoder
+            |
+            v
+        z_t
+            |
+            + action chunk
+            |
+            v
+        dynamics transformer
+            |
+            v
+        predicted future latents
+
+
+    Future observations are encoded by an EMA target encoder:
+
+        future observation
+            |
+            v
+        target encoder
+            |
+            v
+        target future latents
+
+
+    The target encoder receives no gradients.
+    """
+
+    def __init__(
+        self,
+        visual_feature_dim, int = 768,
+        latent_dim: int = 384,
+        latent_grid_size: int = 4,
+        task_state_dim: int = 9,
+        robot_config_dim: int = 7,
+        action_dim: int = 7,
+        horizon: int = 16,
+        num_dynamics_layers: int = 6,
+        num_dynamics_heads: int = 6,
+        dynamics_ff_dim: int = 1536,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.visual_feature_dim = visual_feature_dim
+        self.latent_dim = latent_dim
+        self.latent_grid_size = latent_grid_size
+        self.horizon = horizon
+        self.task_state_dim = task_state_dim
+        self.robot_config_dim = robot_config_dim
+
+        # ====================================================
+        # Number of latent tokens
+        # ====================================================
+        #
+        # Each camera:
+        #
+        #     latent_grid_size^2
+        #
+        # With 4x4:
+        #
+        #     16 tokens per camera
+        #
+        # plus:
+        #
+        #     1 task-state token
+        #     1 robot-config token
+        #
+        # ====================================================
+
+        self.num_visual_tokens_per_camera = latent_grid_size * latent_grid_size
+        self.num_state_tokens = 2 * self.num_visual_tokens_per_camera + 2
+
+        self.online_encoder = ObservationEncoderVjepa(
+                visual_feature_dim=visual_feature_dim,
+                latent_dim=latent_dim,
+                task_state_dim=task_state_dim,
+                robot_config_dim=robot_config_dim,
+        )
+
+
+        # ====================================================
+        # Dynamics predictor
+        # ====================================================
+
+        self.dynamics = DynamicsTransformer(
+               latent_dim=latent_dim,
+               action_dim=action_dim,
+               num_state_tokens=self.num_state_tokens,
+               horizon=horizon,
+               num_layers=num_dynamics_layers,
+               num_heads=num_dynamics_heads,
+               ff_dim=dynamics_ff_dim,
+               dropout=dropout,
+        )
+
+        # ====================================================
+        # Prediction heads
+        #
+        # Dynamics hidden state is 384-D.
+        #
+        # Visual prediction goes back into the ORIGINAL
+        # frozen V-JEPA 768-D representation.
+        # ====================================================
+        self.visual_prediction_head = nn.Linear(latent_dim, visual_feature_dim)
+        self.task_prediction_head = nn.Linear(latent_dim, task_state_dim)
+        self.config_prediction_head = nn.Linear(latent_dim, robot_config_dim)
+
+        # ====================================================
+        # State normalization
+        #
+        # These are filled from TRAINING data.
+        # ====================================================
+
+        self.register_buffer(
+            "task_mean",
+            torch.zeros(task_state_dim),
+        )
+
+        self.register_buffer(
+            "task_std",
+            torch.ones(task_state_dim),
+        )
+
+        self.register_buffer(
+            "config_mean",
+            torch.zeros(robot_config_dim),
+        )
+
+        self.register_buffer(
+            "config_std",
+            torch.ones(robot_config_dim),
+        )
+
+    @torch.no_grad()
+    def set_state_normalization(
+        self,
+        task_mean,
+        task_std,
+        config_mean,
+        config_std,
+    ):
+        self.task_mean.copy_(task_mean)
+        self.task_std.copy_(task_std.clamp_min(1e-6))
+
+        self.config_mean.copy_(config_mean)
+        self.config_std.copy_(config_std.clamp_min(1e-6))
+
+    
+    def encode_current_features(
+        self,
+        agent_features: torch.Tensor,
+        wrist_features: torch.Tensor,
+        task_state: torch.Tensor,
+        robot_config: torch.Tensor,
+    ):
+        """
+        Encode current observation from cached ViT features.
+
+        Output:
+
+            [B, N, D]
+        """
+
+        # Normalize low-dimensional state BEFORE
+        # feeding it to the state encoder.
+
+        task_state_norm = (task_state - self.task_mean) / self.task_std
+        robot_config_norm = (robot_config - self.config_mean) / self.config_std
+
+        return self.online_encoder.forward_features(
+            agent_features=agent_features,
+            wrist_features=wrist_features,
+            task_state=task_state_norm,
+            robot_config=robot_config_norm,
+        )
+
+
+    def predict_future(
+            self,
+            current_latent: torch.Tensor,
+            actions: torch.Tensor,
+    ):
+        """
+        Predict the whole future latent chunk.
+
+        Inputs:
+
+            current_latent:
+                [B, N, D]
+
+            actions:
+                [B, H, action_dim]
+
+        Output:
+
+            [B, H, N, D]
+        """
+
+        hidden_future = self.dynamics(
+            state_tokens=current_latent,
+            actions=actions,
+        )
+
+        return self.decode_future(hidden_future)
+
+
+    def decode_future(
+            self,
+            hiddent_future,
+    ):
+        """
+        hidden_future:
+            [B, H, 34, 384]
+
+        Returns predictions in FIXED target spaces.
+        """
+
+        V = self.num_visual_tokens_per_camera
+
+        agent_hidden = hiddent_future[:, :, :V, :]
+        wrist_hidden = hiddent_future[:, :, V:2*V, :]
+
+        task_hidden = hiddent_future[:, :, 2*V, :]
+        config_hidden = hiddent_future[:, :, 2*V+1, :]
+
+        agent_prediction = self.visual_prediction_head(agent_hidden)
+        wrist_prediction = self.visual_prediction_head(wrist_hidden)
+
+        task_prediction = self.task_prediction_head(task_hidden)
+        config_prediction = self.config_prediction_head(config_hidden)
+
+        return {
+            "agent_features":
+                agent_prediction,
+
+            "wrist_features":
+                wrist_prediction,
+
+            "task_state":
+                task_prediction,
+
+            "robot_config":
+                config_prediction,
+        }
+
+
+    def forward_features(
+        self,
+        agent_features: torch.Tensor,
+        wrist_features: torch.Tensor,
+        task_state: torch.Tensor,
+        robot_config: torch.Tensor,
+        actions: torch.Tensor,
+        future_agent_features: torch.Tensor,
+        future_wrist_features: torch.Tensor,
+        future_task_state: torch.Tensor,
+        future_robot_config: torch.Tensor,
+    ):
+        """
+        Full world-model forward pass using cached ViT features.
+        """
+
+        # ========================================================
+        # Current state
+        # ========================================================
+
+        current_latent = self.encode_current_features(
+                agent_features=agent_features,
+                wrist_features=wrist_features,
+                task_state=task_state,
+                robot_config=robot_config,
+        )
+
+        # ========================================================
+        # Predict future
+        # ========================================================
+
+        predicted_future = self.predict_future(
+            current_latent=current_latent,
+            actions=actions,
+        )
+
+        # ========================================================
+        # EMA targets
+        # ========================================================
+
+        target_future = {
+            "agent_features":
+                future_agent_features,
+
+            "wrist_features":
+                future_wrist_features,
+
+            "task_state":
+                (
+                    future_task_state
+                    - self.task_mean
+                )
+                / self.task_std,
+
+            "robot_config":
+                (
+                    future_robot_config
+                    - self.config_mean
+                )
+                / self.config_std,
+        }
+
+        return {
+            "current_latent":
+                current_latent,
+
+            "predicted_future":
+                predicted_future,
+
+            "target_future":
+                target_future,
+        }
+
+
+    def compute_latent_loss(
+            self,
+            predicted_future: torch.Tensor,
+            target_future: torch.Tensor,
+    ):
+        """
+        Compute group-balanced latent prediction loss.
+
+
+        We calculate each group independently so the 32 visual
+        tokens do not numerically overwhelm the two robot-state
+        tokens.
+        """
+
+        agent_pred = F.normalize(
+            predicted_future["agent_features"],
+            dim=-1,
+        )
+
+        agent_target = F.normalize(
+            target_future["agent_features"],
+            dim=-1,
+        )
+
+        wrist_pred = F.normalize(
+            predicted_future["wrist_features"],
+            dim=-1,
+        )
+
+        wrist_target = F.normalize(
+            target_future["wrist_features"],
+            dim=-1,
+        )
+
+
+        # ====================================================
+        # Loss per semantic group
+        # ====================================================
+
+         # 1 - cosine similarity
+        agent_loss = (1.0 - (agent_pred * agent_target).sum(-1)).mean()
+        wrist_loss = (1.0 - (wrist_pred * wrist_target).sum(-1)).mean()
+
+        # 2 - robot state loss
+        task_loss = F.smooth_l1_loss(
+            predicted_future["task_state"],
+            target_future["task_state"],
+        )
+
+        config_loss = F.smooth_l1_loss(
+            predicted_future["robot_config"],
+            target_future["robot_config"],
+        )
+
+
+
+        # ====================================================
+        # Equal weighting between semantic groups
+        # ====================================================
+
+        total_loss = (
+            agent_loss
+            + wrist_loss
+            + task_loss
+            + config_loss
+        ) / 4.0
+
+        return {
+            "loss":
+                total_loss,
+
+            "agent_loss":
+                agent_loss.detach(),
+
+            "wrist_loss":
+                wrist_loss.detach(),
+
+            "task_loss":
+                task_loss.detach(),
+
+            "config_loss":
+                config_loss.detach(),
+        }
+        
+    
+        
 
