@@ -14,6 +14,8 @@ from robosuite.utils.placement_samplers import UniformRandomSampler
 from policies.common.observation_encoder_spatial import ObservationEncoder
 from policies.flow_matching.model import FlowMatchingPolicy
 
+from world_models.data.rollout_recorder import WorldModelRolloutRecorder
+
 # ============================================================
 # Project imports
 # ============================================================
@@ -35,12 +37,12 @@ device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-checkpoint_path = "policies/flow_matching/flowmatching_1_4_ep019.pth"
+checkpoint_path = "policies/flow_matching/flowmatching_1_4_ep015.pth"
 
-num_episodes = 20
+num_episodes = 200
 max_steps = 500
 
-has_renderer = True
+has_renderer = False
 
 # ============================================================
 # Target sampling
@@ -261,8 +263,8 @@ num_heads = int(
     )
 )
 
-execution_horizon = 2
-run_diversity_diagnostics = True
+execution_horizon = 4
+run_diversity_diagnostics = False
 num_diversity_samples = 50
 diversity_seed = 20260922
 route_action_dim = 0
@@ -440,11 +442,15 @@ for episode in range(num_episodes):
         target_cube_pos
     )
 
+    recorder = WorldModelRolloutRecorder(output_root="data/policy_rollouts")
+
     obs = env._get_observations()
     print(obs.keys())
 
+    recorder.start(obs)
+
     initial_cube_z = obs[
-        "cube_pos"
+        "cube_pos" 
     ][2]
 
     was_lifted = False
@@ -602,13 +608,13 @@ for episode in range(num_episodes):
             )
         ):
 
-            action = action_chunk[
-                action_idx
-            ]
+            action = action_chunk[action_idx]
 
-            obs, reward, done, info = env.step(
-                action
-            )
+            next_obs, reward, done, info = env.step(action)
+
+            recorder.step(action=action, next_obs=next_obs)
+
+            obs = next_obs
 
             t += 1
 
@@ -781,34 +787,34 @@ for episode in range(num_episodes):
                 and was_lifted
             )
 
-            rel_target = target_cube_pos - cube_pos
-            eef_rel_target = target_cube_pos - obs["robot0_eef_pos"]
+            # rel_target = target_cube_pos - cube_pos
+            # eef_rel_target = target_cube_pos - obs["robot0_eef_pos"]
 
-            gripper_cube_dist = np.linalg.norm(
-                obs["robot0_eef_pos"] - obs["cube_pos"]
-            )
+            # gripper_cube_dist = np.linalg.norm(
+            #     obs["robot0_eef_pos"] - obs["cube_pos"]
+            # )
 
-            print(
-                f"t={t} "
-                f"cube_rel=({rel_target[0]:+.3f}, {rel_target[1]:+.3f}, {rel_target[2]:+.3f}) "
-                f"eef_rel=({eef_rel_target[0]:+.3f}, {eef_rel_target[1]:+.3f}, {eef_rel_target[2]:+.3f}) "
-                f"action=({action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f})"
-                f"gripper_cube_dist={gripper_cube_dist:.3f}"
-            )
+            # print(
+            #     f"t={t} "
+            #     f"cube_rel=({rel_target[0]:+.3f}, {rel_target[1]:+.3f}, {rel_target[2]:+.3f}) "
+            #     f"eef_rel=({eef_rel_target[0]:+.3f}, {eef_rel_target[1]:+.3f}, {eef_rel_target[2]:+.3f}) "
+            #     f"action=({action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f})"
+            #     f"gripper_cube_dist={gripper_cube_dist:.3f}"
+            # )
 
-            xy_error = np.linalg.norm(
-                target_cube_pos[:2] - cube_pos[:2]
-            )
+            # xy_error = np.linalg.norm(
+            #     target_cube_pos[:2] - cube_pos[:2]
+            # )
 
-            if prev_xy_error is not None:
-                delta_xy_error = xy_error - prev_xy_error
+            # if prev_xy_error is not None:
+            #     delta_xy_error = xy_error - prev_xy_error
 
-                print(
-                    f"xy_error={xy_error:.4f} "
-                    f"d_error={delta_xy_error:+.4f}"
-                )
+            #     print(
+            #         f"xy_error={xy_error:.4f} "
+            #         f"d_error={delta_xy_error:+.4f}"
+            #     )
 
-            prev_xy_error = xy_error
+            # prev_xy_error = xy_error
 
             if success:
 
@@ -922,6 +928,19 @@ for episode in range(num_episodes):
         f"failure={failure_reason} | "
         f"total success {num_success}"
     )
+
+    episode_dir = recorder.save(
+        episode_id=episode,
+        policy_name="flowmatching",
+        checkpoint=checkpoint_path,
+        success=success,
+        failure_type=failure_reason,
+        additional_metadata={
+            "execution_horizon": 4,
+        },
+    )
+
+    print("Saved:", episode_dir)
 
 
 # ============================================================

@@ -506,6 +506,311 @@ def process_trajectory(
         json.dump(metadata, f, indent=2)
 
 
+def load_policy_rollout(
+    episode_dir,
+):
+    """
+    Read an episode saved by WorldModelRolloutRecorder.
+
+    Returns raw image paths, states, actions, and metadata.
+
+    Does not run V-JEPA inference.
+    """
+
+    episode_dir = Path(
+        episode_dir
+    )
+
+    with (
+        episode_dir / "metadata.json"
+    ).open("r") as f:
+        metadata = json.load(f)
+
+    agent_image_paths = sorted(
+        (episode_dir / "agent").glob("*.jpg")
+    )
+
+    wrist_image_paths = sorted(
+        (episode_dir / "wrist").glob("*.jpg")
+    )
+
+    task_state = np.load(
+        episode_dir / "task_state.npy"
+    )
+
+    robot_config = np.load(
+        episode_dir / "robot_config.npy"
+    )
+
+    actions = np.load(
+        episode_dir / "actions.npy"
+    )
+
+    T = len(actions)
+
+    assert len(agent_image_paths) == T + 1
+    assert len(wrist_image_paths) == T + 1
+
+    assert task_state.shape == (
+        T + 1,
+        9,
+    )
+
+    assert robot_config.shape == (
+        T + 1,
+        7,
+    )
+
+    assert actions.shape == (
+        T,
+        7,
+    )
+
+    # Preserve privileged simulator state.
+    privileged = {}
+
+    for name in [
+        "cube_pos",
+        "target_pos",
+    ]:
+
+        path = (
+            episode_dir / f"{name}.npy"
+        )
+
+        if path.exists():
+
+            value = np.load(path)
+
+            assert len(value) == T + 1
+
+            privileged[name] = value
+
+    return {
+        "agent_image_paths":
+            agent_image_paths,
+
+        "wrist_image_paths":
+            wrist_image_paths,
+
+        "task_state":
+            task_state,
+
+        "robot_config":
+            robot_config,
+
+        "actions":
+            actions,
+
+        "privileged":
+            privileged,
+
+        "metadata":
+            metadata,
+    }
+
+def process_policy_rollout(
+    episode_dir,
+    output_root,
+    encoder,
+    processor,
+    device,
+    batch_size,
+    use_amp,
+    skip_existing,
+):
+    episode_dir = Path(episode_dir)
+
+    print()
+    print("processing policy rollout:", episode_dir)
+
+    # ========================================================
+    # Load the rollout saved by our policy recorder
+    # ========================================================
+
+    episode = load_policy_rollout(
+        episode_dir
+    )
+
+    output_dir = (
+        output_root / episode_dir.name
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    agent_output = (
+        output_dir / "agent_features.npy"
+    )
+
+    wrist_output = (
+        output_dir / "wrist_features.npy"
+    )
+
+    metadata_output = (
+        output_dir / "metadata.json"
+    )
+
+    task_output = (
+        output_dir / "task_state.npy"
+    )
+
+    config_output = (
+        output_dir / "robot_config.npy"
+    )
+
+    actions_output = (
+        output_dir / "actions.npy"
+    )
+
+    # ========================================================
+    # Skip only when the complete cache is available
+    # ========================================================
+
+    output_files = [
+        agent_output,
+        wrist_output,
+        task_output,
+        config_output,
+        actions_output,
+        metadata_output,
+    ]
+
+    if skip_existing and all(
+        path.exists()
+        for path in output_files
+    ):
+        print("  complete feature cache exists; skipping")
+        return
+
+    # ========================================================
+    # Agent camera
+    #
+    # Reuse the SAME extractor as expert trajectories.
+    # ========================================================
+
+    print("  agent camera")
+
+    extract_pooled_features(
+        encoder=encoder,
+        image_paths=episode["agent_image_paths"],
+        processor=processor,
+        device=device,
+        batch_size=batch_size,
+        output_path=agent_output,
+        use_amp=use_amp,
+    )
+
+    # ========================================================
+    # Wrist camera
+    # ========================================================
+
+    print("  wrist camera")
+
+    extract_pooled_features(
+        encoder=encoder,
+        image_paths=episode["wrist_image_paths"],
+        processor=processor,
+        device=device,
+        batch_size=batch_size,
+        output_path=wrist_output,
+        use_amp=use_amp,
+    )
+
+    # ========================================================
+    # Low-dimensional state
+    # ========================================================
+
+    np.save(
+        task_output,
+        episode["task_state"],
+    )
+
+    np.save(
+        config_output,
+        episode["robot_config"],
+    )
+
+    np.save(
+        actions_output,
+        episode["actions"],
+    )
+
+    # ========================================================
+    # Preserve privileged states for later experiments
+    # ========================================================
+
+    for name, value in (
+        episode["privileged"].items()
+    ):
+        np.save(
+            output_dir / f"{name}.npy",
+            value,
+        )
+
+    # ========================================================
+    # Metadata
+    # ========================================================
+
+    metadata = {
+        **episode["metadata"],
+
+        "source":
+            "policy_rollout",
+
+        "source_dir":
+            str(episode_dir),
+
+        "length":
+            len(episode["task_state"]),
+
+        "num_actions":
+            len(episode["actions"]),
+
+        "num_observations":
+            len(episode["task_state"]),
+
+        "feature_encoder":
+            "V-JEPA-2.1 ViT-B/16",
+
+        "feature_encoder_hub_name":
+            VJEPA_MODEL_NAME,
+
+        "input_resolution":
+            IMAGE_SIZE,
+
+        "patch_size":
+            PATCH_SIZE,
+
+        "latent_grid_size":
+            LATENT_GRID_SIZE,
+
+        "feature_dim":
+            encoder.embed_dim,
+
+        "feature_dtype":
+            "float16",
+
+        "frozen_encoder":
+            True,
+    }
+
+    # Write metadata LAST, once other files are saved.
+    with metadata_output.open("w") as f:
+        json.dump(
+            metadata,
+            f,
+            indent=2,
+        )
+
+    print(
+        "  saved:",
+        output_dir,
+    )
+
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -545,6 +850,14 @@ def main():
         action="store_true",
     )
 
+    parser.add_argument(
+        "--source",
+        type=str,
+        choices=["expert", "policy"],
+        default="expert",
+        help="Input trajectory format",
+    )
+
     args = parser.parse_args()
 
     device = torch.device(
@@ -563,10 +876,28 @@ def main():
         args.output_root,
     )
 
-    files = sorted(Path(args.data_root).glob("*.pkl"))
+    if args.source == "expert":
+
+        files = sorted(
+            Path(args.data_root).glob("*.pkl")
+        )
+
+    else:
+
+        files = sorted(
+            path
+            for path in Path(args.data_root).iterdir()
+            if (
+                path.is_dir()
+                and (path / "metadata.json").exists()
+            )
+        )
 
     if not files:
-        raise RuntimeError("No trajectory files found")
+        raise RuntimeError(
+            f"No {args.source} trajectories found "
+            f"in {args.data_root}"
+        )
 
     output_root = Path(args.output_root)
 
@@ -620,17 +951,31 @@ def main():
 
     for trajectory_file in files:
 
-        process_trajectory(
-            trajectory_file=trajectory_file,
-            output_root=output_root,
-            encoder=encoder,
-            processor=processor,
-            device=device,
-            batch_size=args.batch_size,
-            use_amp=not args.no_amp,
-            skip_existing=not args.no_skip_existing,
-        )
+        if args.source == "expert":
 
+            process_trajectory(
+                trajectory_file=trajectory_file,
+                output_root=output_root,
+                encoder=encoder,
+                processor=processor,
+                device=device,
+                batch_size=args.batch_size,
+                use_amp=not args.no_amp,
+                skip_existing=not args.no_skip_existing,
+            )
+
+        else:
+
+            process_policy_rollout(
+                episode_dir=trajectory_file,
+                output_root=output_root,
+                encoder=encoder,
+                processor=processor,
+                device=device,
+                batch_size=args.batch_size,
+                use_amp=not args.no_amp,
+                skip_existing=not args.no_skip_existing,
+            )
 
 if __name__ == "__main__":
     main()

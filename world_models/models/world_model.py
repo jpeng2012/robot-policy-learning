@@ -985,8 +985,6 @@ class LatentWorldModelVjepa(nn.Module):
             target_future["robot_config"],
         )
 
-
-
         # ====================================================
         # Equal weighting between semantic groups
         # ====================================================
@@ -1014,7 +1012,57 @@ class LatentWorldModelVjepa(nn.Module):
             "config_loss":
                 config_loss.detach(),
         }
-        
+
+
+    def compute_loss_per_sample(
+        self,
+        predictions,
+        targets,
+    ):
+        """
+        Return one loss value per sample.
+
+        Output:
+            [B]
+        """
+
+        agent_pred = F.normalize(predictions["agent_features"], dim=-1)
+        agent_target = F.normalize(targets["agent_features"], dim=-1)
+
+        wrist_pred = F.normalize(predictions["wrist_features"], dim=-1)
+        wrist_target = F.normalize(targets["wrist_features"], dim=-1)
+
+        # [B, H, tokens]
+        agent_loss = 1.0 - (agent_pred * agent_target).sum(dim=-1)
+        wrist_loss = 1.0 - (wrist_pred * wrist_target).sum(dim=-1)
+
+        # Average over horizon + visual tokens.
+        agent_loss = agent_loss.mean(dim=(1, 2))
+        wrist_loss = wrist_loss.mean(dim=(1, 2))
+
+        # Smooth L1 without reduction.
+        task_loss = F.smooth_l1_loss(predictions["task_state"], targets["task_state"], reduction="none")
+        config_loss = F.smooth_l1_loss(predictions["robot_config"], targets["robot_config"], reduction="none")
+
+        # Average horizon + state dimensions.
+        task_loss = task_loss.mean(dim=(1, 2))
+
+        config_loss = config_loss.mean(dim=(1, 2))
+
+        total_loss = (agent_loss + wrist_loss + task_loss + config_loss) / 4.0
+
+        return {
+            "loss":
+                total_loss,
+            "agent_loss":
+                agent_loss,
+            "wrist_loss":
+                wrist_loss,
+            "task_loss":
+                task_loss,
+            "config_loss":
+                config_loss,
+        }
     
         
 
